@@ -1,0 +1,23 @@
+# Secrets / local config
+.env
+*.env
+
+# Persistent Amazon Chrome profile (holds logged-in session cookies)
+.chrome-profile-amazon/
+
+# Debug HTML snapshots dumped by scrapers on unexpected pages
+page_*.html
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+env/
+.venv/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
