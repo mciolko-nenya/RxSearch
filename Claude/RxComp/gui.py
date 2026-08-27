@@ -42,6 +42,7 @@ than the threading this now needs for the modal to work at all.
 
 from __future__ import annotations
 
+import os
 import threading
 import webbrowser
 from dataclasses import asdict
@@ -140,7 +141,13 @@ gui_notifier = GuiChallengeNotifier()
 driver_utils.set_challenge_notifier(gui_notifier)
 _run_lock = threading.Lock()
 
-PORT = 5057
+# Render (and most PaaS hosts) inject $PORT and expect the app to bind
+# 0.0.0.0 to it; a plain local `python gui.py` has neither set, so this
+# also doubles as the "are we deployed, not local" signal used below to
+# skip the local-only browser auto-open.
+_DEPLOYED = "PORT" in os.environ
+PORT = int(os.environ.get("PORT", 5057))
+HOST = os.environ.get("HOST", "0.0.0.0" if _DEPLOYED else "127.0.0.1")
 
 PAGE = """<!doctype html>
 <html lang="en">
@@ -217,15 +224,17 @@ PAGE = """<!doctype html>
   </div>
 
   <div class="sites">
-    {% for site in all_sites %}
-    <label><input type="checkbox" class="site-checkbox" value="{{ site }}" {% if site in enabled_sites %}checked{% endif %}> {{ site }}</label>
+    {% for site in available_sites %}
+    <label><input type="checkbox" class="site-checkbox" value="{{ site }}" checked> {{ site }}</label>
     {% endfor %}
     <label><input type="checkbox" id="debug"> Debug (visible browser)</label>
   </div>
 
   <div class="actions">
     <button type="submit" id="search-btn">Search</button>
+    {% if 'amazon' in available_sites %}
     <button type="button" class="secondary" id="setup-amazon-btn">Set up Amazon login…</button>
+    {% endif %}
     <span id="status"></span>
   </div>
 </form>
@@ -258,7 +267,9 @@ const challengeDoneBtn = document.getElementById('challenge-done-btn');
 
 function setBusy(busy) {
   searchBtn.disabled = busy;
-  setupBtn.disabled = busy;
+  // setupBtn is null when amazon isn't in this deployment's ENABLED_SITES
+  // — the template omits the button entirely rather than just disabling it.
+  if (setupBtn) setupBtn.disabled = busy;
 }
 
 // Polls for a pending challenge the whole time the page is open, not
@@ -380,24 +391,28 @@ form.addEventListener('submit', async (e) => {
   }
 });
 
-setupBtn.addEventListener('click', async () => {
-  setBusy(true);
-  setStatus('Opening Chrome for Amazon login — log in there, then click Done in the box ' +
-             'that pops up here.');
-  try {
-    const resp = await fetch('/api/setup-amazon', {method: 'POST'});
-    const data = await resp.json();
-    if (!resp.ok) {
-      setStatus(data.error || 'Amazon setup failed.', true);
-    } else {
-      setStatus('Amazon login saved. You can now include amazon in searches.');
+// setupBtn is null when amazon isn't in this deployment's ENABLED_SITES —
+// the template omits the whole button, so there's nothing to wire up.
+if (setupBtn) {
+  setupBtn.addEventListener('click', async () => {
+    setBusy(true);
+    setStatus('Opening Chrome for Amazon login — log in there, then click Done in the box ' +
+               'that pops up here.');
+    try {
+      const resp = await fetch('/api/setup-amazon', {method: 'POST'});
+      const data = await resp.json();
+      if (!resp.ok) {
+        setStatus(data.error || 'Amazon setup failed.', true);
+      } else {
+        setStatus('Amazon login saved. You can now include amazon in searches.');
+      }
+    } catch (err) {
+      setStatus('Amazon setup failed: ' + err, true);
+    } finally {
+      setBusy(false);
     }
-  } catch (err) {
-    setStatus('Amazon setup failed: ' + err, true);
-  } finally {
-    setBusy(false);
-  }
-});
+  });
+}
 </script>
 </body>
 </html>
@@ -406,8 +421,15 @@ setupBtn.addEventListener('click', async () => {
 
 @app.route("/")
 def index():
+    # Deliberately Config.ENABLED_SITES here, not Config.ALL_SITES: a
+    # site this deployment has disabled (e.g. a Cost-Plus-Drugs-only
+    # Render deployment with ENABLED_SITES=costplusdrugs, which has no
+    # Chrome/display to run the other three sites' Selenium flows at
+    # all) shouldn't even be offered as a checkbox — see api_search()'s
+    # matching restriction below for why offering it would be worse than
+    # just confusing.
     return render_template_string(
-        PAGE, all_sites=Config.ALL_SITES, enabled_sites=Config.ENABLED_SITES,
+        PAGE, available_sites=Config.ENABLED_SITES, enabled_sites=Config.ENABLED_SITES,
         default_zip=Config.DEFAULT_ZIP_CODE or "",
     )
 
@@ -425,7 +447,13 @@ def api_search():
         formulation = (payload.get("formulation") or "").strip() or "tablet"
         quantity = (payload.get("quantity") or "").strip() or None
         zip_code = (payload.get("zip") or "").strip() or None
-        sites = [s for s in (payload.get("sites") or []) if s in Config.ALL_SITES]
+        # Config.ENABLED_SITES, not Config.ALL_SITES: this is the actual
+        # enforcement point. Without it, a client could still POST
+        # {"sites": ["goodrx"]} on a deployment that deliberately
+        # disabled every Selenium-based site (e.g. no Chrome installed
+        # at all) regardless of what the rendered checkboxes offer —
+        # the template restriction above is only the UI half of this.
+        sites = [s for s in (payload.get("sites") or []) if s in Config.ENABLED_SITES]
 
         if not drug_name or not dosage:
             return jsonify({"error": "Drug and Dosage are both required."}), 400
@@ -481,6 +509,12 @@ def api_search():
 
 @app.route("/api/setup-amazon", methods=["POST"])
 def api_setup_amazon():
+    # Same restriction as api_search()'s site filter, for the same
+    # reason: a deployment that disabled amazon (no Chrome/display to
+    # actually run its interactive login flow on) shouldn't let this
+    # route try anyway just because it was hit directly.
+    if "amazon" not in Config.ENABLED_SITES:
+        return jsonify({"error": "Amazon is not enabled on this deployment (amazon not in ENABLED_SITES)."}), 403
     if not _run_lock.acquire(blocking=False):
         return jsonify({"error": "A search or Amazon setup is already running — wait for it to finish."}), 409
     try:
@@ -534,9 +568,12 @@ def api_challenge_confirm():
 
 
 def main_gui():
-    url = f"http://127.0.0.1:{PORT}"
-    print(f"RxComp GUI running at {url} — opening your browser...")
-    threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    if _DEPLOYED:
+        print(f"RxComp GUI running on {HOST}:{PORT}")
+    else:
+        url = f"http://127.0.0.1:{PORT}"
+        print(f"RxComp GUI running at {url} — opening your browser...")
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     # threaded=True is required now, not just nice-to-have: a search or
     # Amazon-setup request can sit blocked inside
     # wait_for_challenge_confirmation() for as long as a challenge modal
@@ -544,7 +581,7 @@ def main_gui():
     # /api/challenge/confirm *while that's happening* — an unthreaded dev
     # server could never serve those, and the modal's "Done" button would
     # have no way to actually reach the waiting thread.
-    app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True)
+    app.run(host=HOST, port=PORT, debug=False, threaded=True)
 
 
 if __name__ == "__main__":
