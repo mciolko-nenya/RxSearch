@@ -304,6 +304,73 @@ Presentation only, same as before: the `/api/search` route calls
 reimplementing any of that logic, so the GUI and the CLI always behave
 identically.
 
+## API
+
+`gui.py` also serves a plain JSON API, separate from the browser page and
+the page's own internal `/api/search` (a POST-with-JSON-body endpoint
+that's this GUI's own implementation detail — its exact shape is free to
+change alongside the page, since nothing outside it depends on that
+contract). The API below is the stable, documented one meant for
+external callers — same underlying pipeline either way, since both just
+call `main.py`'s own functions.
+
+```bash
+python gui.py   # same server, same command, as before
+```
+
+**`GET /api/v1/prices`** — query parameters:
+
+| Param | Required | Meaning |
+|---|---|---|
+| `drug` | yes | Drug name, e.g. `lisinopril` |
+| `dosage` | yes | Dosage/strength, e.g. `20mg` |
+| `formulation` | no (default `tablet`) | e.g. `tablet`, `capsule`, `liquid` |
+| `quantity` | no | Requested pack size, e.g. `30` — same rescaling/exact-quote behavior as `--quantity` on the CLI (see [What quantity is this pricing for?](#what-quantity-is-this-pricing-for)) |
+| `zip` | no | ZIP code — ignored by Cost Plus Drugs, used by GoodRx/SingleCare |
+| `sites` | no (default: this deployment's `ENABLED_SITES`) | Comma-separated subset, e.g. `sites=costplusdrugs` or `sites=goodrx,amazon`. Validated against `ENABLED_SITES`, not the full four — a site this deployment has disabled (e.g. a Cost-Plus-Drugs-only Render deployment with no Chrome installed at all) is rejected here even if requested explicitly, not just hidden from the GUI's checkboxes |
+
+```bash
+curl "http://localhost:5057/api/v1/prices?drug=lisinopril&dosage=20mg&quantity=30&sites=costplusdrugs"
+```
+
+Returns `{"results": [...]}`, one entry per `PriceResult` (same fields
+the CLI's `--json` output and `/api/search` already use — `source`,
+`price`, `price_label`, `quantity`, `url`, `error`, etc.). A request-level
+problem (missing `drug`/`dosage`, an unknown/disabled site) is a `400`
+with an `{"error": ...}` body; a per-site failure (blocked, no match,
+bot check) is a normal `200` with that site's own `PriceResult.error`
+set instead — the same "never raise, report a failed row" contract every
+scraper's `get_prices()` already follows, extended to the API's own
+request-level validation too.
+
+**`GET /api/v1/sites`** — returns `{"sites": [...]}`, this deployment's
+actual `ENABLED_SITES`. Lets a caller discover what's queryable without
+hard-coding site names or guessing from a Render deployment's config.
+
+**CAPTCHAs are force-disabled for API calls, not just left to time out.**
+GoodRx and SingleCare can show an interactive CAPTCHA that the GUI's own
+`/api/search` handles by blocking the request and showing a human a
+browser modal to solve it in (see above) — an API caller has neither a
+modal nor a human watching. Left alone, a challenged site would just
+block an `/api/v1/prices` request for the full 30-minute challenge
+timeout before finally reporting failure. Instead, `_captcha_disabled_for_api()`
+temporarily forces `GOODRX_INTERACTIVE_CAPTCHA`/`SINGLECARE_INTERACTIVE_CAPTCHA`
+off for the duration of the request (restored afterward — these are
+shared `Config` class attributes, not per-request state, so a
+concurrent GUI search must get its real interactive behavior back
+unaffected) — a challenged site fails fast with a normal error result
+instead of hanging. Verified directly: the flags flip off inside the
+context manager and are restored afterward, including when the
+lookup itself raises.
+
+Only the three Selenium-based sites (`goodrx`/`singlecare`/`amazon`)
+take the same `_run_lock` the GUI's searches already use — it exists to
+stop two browser sessions launching at once, so a `sites=costplusdrugs`
+request skips it entirely and never queues behind an unrelated
+GoodRx/SingleCare/Amazon lookup. Verified live: `sites=costplusdrugs`
+returns immediately with a real price; `sites=notarealsite` and a
+request missing `drug`/`dosage` both return the expected `400`.
+
 ## Configuration
 
 All settings live in `.env` (see `.env.example`); nothing is hardcoded and
@@ -2300,6 +2367,10 @@ actually safe, not just cosmetic:
    not use a Blueprint — same three settings, plus that one env var.
 3. Deploy. Render assigns a public URL; open it and you should see the
    GUI with only a "costplusdrugs" checkbox and no Amazon-setup button.
+   The [documented JSON API](#api) works the same way once deployed —
+   `curl "https://your-app.onrender.com/api/v1/prices?drug=lisinopril&dosage=20mg&sites=costplusdrugs"` —
+   and rejects any other site the same way the GUI's checkboxes do,
+   since both enforce `ENABLED_SITES` server-side.
 
 ### Worth knowing before you do
 

@@ -42,6 +42,7 @@ than the threading this now needs for the modal to work at all.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import webbrowser
@@ -432,6 +433,141 @@ def index():
         PAGE, available_sites=Config.ENABLED_SITES, enabled_sites=Config.ENABLED_SITES,
         default_zip=Config.DEFAULT_ZIP_CODE or "",
     )
+
+
+#: Sites whose get_prices() drives a real Selenium browser and can show
+#: an interactive CAPTCHA — see _captcha_disabled_for_api() below for why
+#: that matters specifically for /api/v1/prices, not for the GUI's own
+#: /api/search.
+SELENIUM_SITES = {"goodrx", "singlecare", "amazon"}
+
+
+@contextlib.contextmanager
+def _captcha_disabled_for_api():
+    """A programmatic API caller has no visible Chrome window to solve a
+    CAPTCHA in and no "Done" button to click — unlike the GUI, which
+    exists specifically to give a human both of those (see this module's
+    docstring). Left as-is, a challenged site would just block an API
+    request for the full CHALLENGE_TIMEOUT_SECONDS (30 minutes) with no
+    one ever able to answer the prompt, then finally report a timeout —
+    the worst possible version of "this site is unavailable right now."
+    Forcing both interactive-CAPTCHA flags off for the duration of an
+    /api/v1/prices call instead makes a challenged site fail fast with a
+    normal, same-shape PriceResult error, exactly like any other lookup
+    failure.
+
+    Config.GOODRX_INTERACTIVE_CAPTCHA/SINGLECARE_INTERACTIVE_CAPTCHA are
+    shared class attributes, not per-request state, so this saves and
+    restores the originals afterward rather than leaving them forced off
+    — otherwise a GUI search that starts concurrently (or right after)
+    would silently lose its own human-in-the-loop CAPTCHA solving too.
+    Safe to overlap with the GUI's own use of these flags only because
+    every caller of this — like every caller that touches a Selenium
+    site at all — is expected to be holding _run_lock first; see
+    api_v1_prices()."""
+    prev_goodrx = Config.GOODRX_INTERACTIVE_CAPTCHA
+    prev_singlecare = Config.SINGLECARE_INTERACTIVE_CAPTCHA
+    Config.GOODRX_INTERACTIVE_CAPTCHA = False
+    Config.SINGLECARE_INTERACTIVE_CAPTCHA = False
+    try:
+        yield
+    finally:
+        Config.GOODRX_INTERACTIVE_CAPTCHA = prev_goodrx
+        Config.SINGLECARE_INTERACTIVE_CAPTCHA = prev_singlecare
+
+
+@app.route("/api/v1/sites")
+def api_v1_sites():
+    """Lets a programmatic caller discover what's actually queryable on
+    this deployment without hard-coding site names — e.g. a Cost-Plus-
+    Drugs-only Render deployment (see README.md's "Deploying to
+    Render.com") reports just that one site here, matching exactly what
+    /api/v1/prices will accept."""
+    return jsonify({"sites": list(Config.ENABLED_SITES)})
+
+
+@app.route("/api/v1/prices")
+def api_v1_prices():
+    """The documented, stable JSON API — see README.md's "API" section.
+    Deliberately a separate route from /api/search rather than a
+    reskin of it: that one is this GUI page's own internal
+    implementation detail (POST, JSON body, a `debug` flag meaningful
+    only to a person watching the browser) and is free to change
+    alongside the page; this one is the public contract external
+    callers should be able to rely on — GET with plain query
+    parameters, so it's curl/browser-address-bar friendly, and no
+    `debug` option (an API caller has no visible browser to watch
+    regardless)."""
+    drug_name = (request.args.get("drug") or "").strip()
+    dosage = (request.args.get("dosage") or "").strip()
+    formulation = (request.args.get("formulation") or "").strip() or "tablet"
+    quantity = (request.args.get("quantity") or "").strip() or None
+    zip_code = (request.args.get("zip") or "").strip() or None
+
+    if not drug_name or not dosage:
+        return jsonify({"error": "'drug' and 'dosage' query parameters are both required."}), 400
+
+    sites_param = request.args.get("sites")
+    if sites_param:
+        requested = [s.strip() for s in sites_param.split(",") if s.strip()]
+        # Config.ENABLED_SITES, not Config.ALL_SITES — same enforcement
+        # point as /api/search's identical restriction, and for the same
+        # reason: a deployment that disabled a site (no Chrome installed
+        # for it at all, e.g. a Cost-Plus-Drugs-only Render deployment)
+        # must actually refuse it here, not just leave it off a UI this
+        # endpoint doesn't have.
+        unknown = [s for s in requested if s not in Config.ENABLED_SITES]
+        if unknown:
+            return jsonify({
+                "error": f"unknown or disabled site(s): {', '.join(unknown)} "
+                         f"(available: {', '.join(Config.ENABLED_SITES)})"
+            }), 400
+        sites = requested
+    else:
+        sites = list(Config.ENABLED_SITES)
+
+    try:
+        Config.validate()
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    global _scrapers_loaded
+    if not _scrapers_loaded:
+        main._load_scrapers()
+        _scrapers_loaded = True
+
+    # Only the three Selenium-based sites need _run_lock at all (it
+    # exists to keep two browser sessions from launching at once — see
+    # this module's docstring) — a Cost-Plus-Drugs-only request never
+    # touches Selenium and would otherwise queue behind an unrelated
+    # GoodRx/SingleCare/Amazon lookup for no reason. Real concurrency
+    # only matters for that fast, lock-free path; the Selenium sites are
+    # already serialized with the GUI's own searches for a real reason
+    # (shared browser/profile state), so this doesn't try to improve on
+    # that beyond skipping it when it isn't needed at all.
+    needs_lock = bool(set(sites) & SELENIUM_SITES)
+
+    def _run_pipeline():
+        results = main.gather_results(sites, drug_name, formulation, dosage, zip_code, quantity, sequential=True)
+        results = main.filter_out_insurance_required(results)
+        results = main.normalize_quantities(results, quantity)
+        return main.sort_results(results)
+
+    try:
+        if needs_lock:
+            if not _run_lock.acquire(blocking=False):
+                return jsonify({"error": "A search or Amazon setup is already running — try again shortly."}), 409
+            try:
+                with _captcha_disabled_for_api():
+                    results = _run_pipeline()
+            finally:
+                _run_lock.release()
+        else:
+            results = _run_pipeline()
+    except Exception as e:
+        return jsonify({"error": f"unexpected error: {e}"}), 500
+
+    return jsonify({"results": [asdict(r) for r in results]})
 
 
 @app.route("/api/search", methods=["POST"])
