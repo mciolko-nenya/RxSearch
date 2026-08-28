@@ -51,9 +51,33 @@ typed by its brand name would otherwise falsely report "not carried"
 even though Cost Plus Drugs stocks it — get_prices() now retries against
 brand_name whenever the medication_name lookup comes back empty, before
 reporting a real miss.
+
+A third, separate gap: "Atorvastatin Calcium" (salt name included) still
+missed both of the above, since the catalog's own medication_name for it
+is the bare "Atorvastatin" — confirmed live that catalog naming is
+inconsistent about this (252 of 872 unique medication_names *do* include
+a salt word, e.g. "Acebutolol HCl"; most don't). Fixed via
+_salt_stripped_lookup(): confirmed live that calling this API with *no*
+filter params returns its entire catalog (2,373 rows), which is fetched
+once, cached, and matched against after normalizing away pure salt
+words. Deliberately conservative: never strips release-timing words
+(ER/XR/DR/SR/CR — confirmed live those mark real, non-interchangeable
+products, e.g. "Metoprolol Tartrate" vs. "Metoprolol Extended Release
+(ER)"), and even pure-salt normalization can still collapse two
+genuinely distinct products onto the same key (confirmed live:
+"Diclofenac Potassium" vs. "Diclofenac Sodium", "Levalbuterol HCl" vs.
+"Levalbuterol Tartrate") — so it only auto-accepts when exactly one
+catalog name matches, and reports the specific candidates instead of
+guessing when there's more than one. Deliberately does NOT add
+true edit-distance/typo fuzzy matching on top of this — real drug names
+are frequently one or two characters apart from a *different* real drug
+(the same reasoning that kept amazon_scraper.py's drug-name matching
+exact rather than fuzzy).
 """
 
 from __future__ import annotations
+
+import re
 
 import requests
 
@@ -65,6 +89,97 @@ from utils import extract_price_from_text, token_matches
 SOURCE_NAME = "Cost Plus Drugs"
 
 API_BASE_URL = "https://us-central1-costplusdrugs-publicapi.cloudfunctions.net/main"
+
+# Deliberately only true salt/counterion words — never release-timing
+# modifiers ("ER"/"XR"/"XL"/"SR"/"CR"/"DR"/"extended release"/"delayed
+# release"). Confirmed live against the full catalog (see
+# _get_full_catalog()) that those mark genuinely different products —
+# e.g. "Metoprolol Tartrate" (immediate-release) vs. "Metoprolol
+# Extended Release (ER)" are not interchangeable, so stripping them
+# could silently collapse two different real drugs into the same
+# lookup. Pure salt words are safer but still not risk-free — see
+# _salt_stripped_lookup()'s ambiguous-match handling.
+_SALT_WORDS = {
+    "calcium", "sodium", "potassium", "magnesium", "hcl", "hydrochloride",
+    "succinate", "tartrate", "maleate", "besylate", "mesylate", "fumarate",
+    "citrate", "sulfate", "sulphate", "phosphate", "acetate", "bitartrate",
+    "dihydrate", "monohydrate", "trihydrate", "oxalate", "gluconate",
+    "chloride", "bromide", "iodide", "carbonate", "nitrate", "stearate",
+}
+
+_FULL_CATALOG_CACHE: list[dict] | None = None
+
+
+def _normalize_for_salt_match(name: str) -> str:
+    """Lowercase, drop punctuation/separators, strip pure salt words —
+    but never strip *every* word: some drugs' whole name is a salt
+    (e.g. "Potassium Chloride", "Calcium Acetate" are themselves the
+    active ingredient, not a salt-of-something-else), so stripping
+    everything there would incorrectly treat two unrelated drugs as
+    the same lookup key."""
+    words = [w for w in re.split(r"[\s/-]+", name.lower()) if w]
+    kept = [w for w in words if w not in _SALT_WORDS] or words
+    return "".join(re.sub(r"[^a-z0-9]", "", w) for w in kept)
+
+
+def _get_full_catalog() -> list[dict]:
+    """Confirmed live: calling the API with no filter params at all
+    returns its *entire* catalog (2,373 rows / 872 unique
+    medication_name values as of this check, ~1.2MB) rather than an
+    error or nothing — that's what makes client-side salt-normalized
+    matching possible below. Cached for the life of the process: this
+    catalog doesn't change minute-to-minute, and re-fetching ~1.2MB on
+    every fallback lookup would be wasteful."""
+    global _FULL_CATALOG_CACHE
+    if _FULL_CATALOG_CACHE is None:
+        _FULL_CATALOG_CACHE = _api_get({})
+    return _FULL_CATALOG_CACHE
+
+
+def _salt_stripped_lookup(drug_name: str) -> tuple[list[dict], str | None, list[str]]:
+    """Last-resort lookup after exact medication_name and brand_name
+    both miss (e.g. "Atorvastatin Calcium" when the catalog only has
+    "Atorvastatin"). Matches the salt-normalized query against every
+    catalog medication_name/brand_name, but only *auto-accepts* when
+    exactly one distinct real catalog name maps to that normalized key.
+
+    Confirmed live this matters: normalizing away salt words alone
+    still collapses some genuinely different, clinically distinct
+    catalog entries onto the same key — e.g. "Diclofenac Potassium"
+    (immediate-release) vs. "Diclofenac Sodium" (enteric-coated), or
+    "Levalbuterol HCl" vs. "Levalbuterol Tartrate". Silently picking
+    one would repeat the exact mistake this project's own
+    identity/dosage/formulation filters elsewhere are built to avoid
+    (showing the wrong drug is worse than showing nothing) — so this
+    returns those as `ambiguous_candidates` instead of guessing, and
+    the caller reports them for the user to disambiguate by retyping
+    the exact one they meant.
+
+    Returns (rows, resolved_name, ambiguous_candidates): `rows` is
+    populated only alongside a non-None `resolved_name` (the single
+    safe match); `ambiguous_candidates` lists 2+ real catalog names
+    when the key wasn't unique.
+    """
+    target = _normalize_for_salt_match(drug_name)
+    if not target:
+        return [], None, []
+
+    catalog = _get_full_catalog()
+    matching_names: dict[str, str] = {}  # catalog name -> field it matched on
+    for row in catalog:
+        for field in ("medication_name", "brand_name"):
+            value = row.get(field, "")
+            if value and value not in matching_names and _normalize_for_salt_match(value) == target:
+                matching_names[value] = field
+
+    candidates = sorted(matching_names)
+    if len(candidates) != 1:
+        return [], None, candidates
+
+    resolved_name = candidates[0]
+    field_used = matching_names[resolved_name]
+    rows = [r for r in catalog if r.get(field_used) == resolved_name]
+    return rows, resolved_name, []
 
 # Cost Plus Drugs' own page used to state its default pack size in plain
 # sentence form ("A 30 count supply of ... will cost:"), varying per
@@ -149,12 +264,26 @@ def get_prices(
             except Exception as e:
                 return _error_result(drug_name, formulation, dosage, f"Cost Plus Drugs API request failed: {e}")
 
+        resolved_via_salt_strip: str | None = None
+        if not rows:
+            try:
+                rows, resolved_via_salt_strip, ambiguous = _salt_stripped_lookup(drug_name)
+            except Exception as e:
+                return _error_result(drug_name, formulation, dosage, f"Cost Plus Drugs API request failed: {e}")
+            if ambiguous:
+                return _error_result(
+                    drug_name, formulation, dosage,
+                    f"'{drug_name}' matches more than one distinct Cost Plus Drugs catalog "
+                    f"entry once salt names are normalized away — refusing to guess which one "
+                    f"you meant: {', '.join(ambiguous)}. Retype the exact one you want.",
+                )
+
         if not rows:
             return _error_result(
                 drug_name, formulation, dosage,
-                f"no Cost Plus Drugs catalog entry for '{drug_name}' (checked both "
-                "generic and brand name — the API requires an exact match, no "
-                "fuzzy/typo tolerance)",
+                f"no Cost Plus Drugs catalog entry for '{drug_name}' (checked generic name, "
+                "brand name, and a salt-normalized match against the full catalog — the API "
+                "itself requires an exact match, no fuzzy/typo tolerance)",
             )
 
         # Form first, then strength — same priority order the old
@@ -225,6 +354,15 @@ def get_prices(
             "standard shipping fee, charged separately at checkout and not "
             "returned by this API"
         )
+        if resolved_via_salt_strip:
+            # Never substitute silently — same "wrong drug is worse than no
+            # drug" philosophy as the hard-exclude formulation/dosage
+            # filters above, just surfaced as a caveat instead of an error
+            # since this path only ever auto-accepts an unambiguous match.
+            label = (
+                f"interpreted '{drug_name}' as Cost Plus Drugs' catalog entry "
+                f"'{resolved_via_salt_strip}' (salt name normalized away); " + label
+            )
 
         return [
             PriceResult(

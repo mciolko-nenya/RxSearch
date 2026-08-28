@@ -2024,10 +2024,60 @@ genuinely nonexistent drug name still correctly reports not-found
 Also confirmed live while investigating this: `medication_name=Atorvastatin
 Calcium` (i.e. including the salt name) returns zero results — the
 catalog's `medication_name` field only stores the bare generic name
-(`"Atorvastatin"`). No fallback was added for this case (unlike the
-brand-name one above) since there's no second field to retry against;
-worth knowing if a "not carried" result looks surprising for a drug
-typed with its salt form included.
+(`"Atorvastatin"`). Catalog naming here is genuinely inconsistent:
+confirmed live that 252 of 872 unique `medication_name` values *do*
+include a salt word (e.g. `"Acebutolol HCl"`, `"Acamprosate Calcium"`),
+so neither "always strip the salt" nor "never strip it" is safe as a
+blanket rule.
+
+**Salt-name fuzzy matching, added as a third tier.** Confirmed live: calling
+the API with *no* filter params at all returns its entire catalog — 2,373
+rows / 872 unique `medication_name` values as of this check, ~1.2MB —
+rather than an error or nothing. `_get_full_catalog()` fetches that once
+and caches it for the process's life (it doesn't change minute-to-minute,
+and re-fetching 1.2MB per fallback lookup would be wasteful).
+`_salt_stripped_lookup()` normalizes away a curated list of pure
+salt/counterion words (calcium, sodium, HCl, sulfate, tartrate, etc.)
+from both the query and every catalog `medication_name`/`brand_name`,
+then matches on the normalized string.
+
+This is deliberately conservative, not open-ended fuzzy/typo matching,
+for two reasons confirmed live during this investigation:
+- **Release-timing words are never stripped.** `"Metoprolol Tartrate"`
+  (immediate-release) and `"Metoprolol Extended Release (ER)"` are real,
+  clinically different catalog entries — stripping "ER"/"XR"/"DR"/"SR"/"CR"
+  the same way salts are stripped would silently collapse them into one
+  lookup.
+- **Even pure-salt normalization isn't collision-free.** Stripping only
+  true salt words still collapses some genuinely distinct products onto
+  the same key — confirmed live: `"Diclofenac Potassium"` (immediate-
+  release) vs. `"Diclofenac Sodium"` (enteric-coated), and
+  `"Levalbuterol HCl"` vs. `"Levalbuterol Tartrate"`. Rather than guess
+  between them (repeating the exact class of mistake this project's
+  formulation/dosage hard-exclude filters exist to avoid — a wrong drug
+  is worse than no drug), `_salt_stripped_lookup()` only *auto-accepts*
+  a normalized match when it resolves to exactly one distinct catalog
+  name. When 2+ distinct names collapse to the same key, `get_prices()`
+  refuses to guess and reports the specific candidates instead
+  (`"'Diclofenac' matches more than one distinct catalog entry ...:
+  Diclofenac Potassium, Diclofenac Sodium"`), so the caller can retype
+  the exact one they meant.
+
+When a salt-normalized match *does* auto-resolve, the result is never
+silently substituted — `price_label` says so explicitly
+(`"interpreted 'Atorvastatin Calcium' as Cost Plus Drugs' catalog entry
+'Atorvastatin' (salt name normalized away); ..."`), confirmed live via
+`get_prices("Atorvastatin Calcium", "tablet", "40mg")` → `$5.72` with that
+caveat attached.
+
+Deliberately **not** added: true edit-distance/typo-tolerant fuzzy
+matching (e.g. `difflib`) beyond salt-stripping. Real drug names are
+often one or two characters apart from a *different* real drug — the
+same reasoning that kept `amazon_scraper.py`'s `_matches_drug_name()`
+exact rather than fuzzy earlier in this project's history. A stricter,
+lower-confidence typo-matching layer could still be added later if
+needed, but only ever as a set of surfaced suggestions to choose from,
+never as a silent auto-pick.
 
 ### Cost Plus Drugs: search, then strength/quantity selection *(retired — historical)*
 
