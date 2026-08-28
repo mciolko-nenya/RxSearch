@@ -2000,6 +2000,35 @@ same as before this switch — for call-signature parity with the other
 three sites' `get_prices()`, not because Cost Plus Drugs' flat mail-order
 pricing varies by location.
 
+**Fuzzy matching: confirmed there is none.** Live-tested directly
+against the endpoint: `medication_name=atorvastatin` (exact, 4 results)
+vs. `atorvastati` (truncated by one char), `torvastatin` (missing first
+char), `vastatin` (substring), `atorvastanin` (transposed letters), and
+`atorvastatin ` (trailing space) — every one of those returned zero
+results. It is case-insensitive (`ATORVASTATIN` still matches) but
+otherwise a plain exact-string lookup key, not a search.
+
+That exactness interacts badly with `medication_name` vs. `brand_name`
+being two disjoint fields: `medication_name=Lipitor` returns nothing —
+Lipitor only exists under `brand_name=Lipitor` (4 results, same drug).
+`medication_name=atorvastatin` is the mirror case. Before this fix,
+`get_prices()` only ever queried `medication_name`, so a user typing a
+brand name got a false "no Cost Plus Drugs catalog entry" even though
+the drug is genuinely stocked. Fixed by retrying `brand_name` whenever
+the `medication_name` lookup comes back empty, before reporting a real
+miss — confirmed live: `get_prices("Lipitor", "tablet", "40mg")` now
+returns a real price (`$5.72`) via the `brand_name` fallback, and a
+genuinely nonexistent drug name still correctly reports not-found
+(mentioning both fields were checked).
+
+Also confirmed live while investigating this: `medication_name=Atorvastatin
+Calcium` (i.e. including the salt name) returns zero results — the
+catalog's `medication_name` field only stores the bare generic name
+(`"Atorvastatin"`). No fallback was added for this case (unlike the
+brand-name one above) since there's no second field to retry against;
+worth knowing if a "not carried" result looks surprising for a drug
+typed with its salt form included.
+
 ### Cost Plus Drugs: search, then strength/quantity selection *(retired — historical)*
 
 Previously built directly from drug name + dosage + form

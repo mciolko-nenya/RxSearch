@@ -40,6 +40,17 @@ different question (is this drug on our own formulary list at all) than
 the live API call does, and the API call is cheap enough now that the
 pre-filter is more a "confirm it's a formulary drug" step than a
 meaningful performance optimization, but removing it wasn't asked for.
+
+Confirmed live, separately: this API does exact-string matching only —
+no fuzzy, substring, or typo tolerance, and it's case-insensitive but
+whitespace-sensitive (a stray leading/trailing space is a miss). More
+importantly, `medication_name` and `brand_name` are two disjoint fields:
+`medication_name=Lipitor` returns nothing, `brand_name=Lipitor` returns
+all 4 strengths; `medication_name=atorvastatin` is the reverse. A drug
+typed by its brand name would otherwise falsely report "not carried"
+even though Cost Plus Drugs stocks it — get_prices() now retries against
+brand_name whenever the medication_name lookup comes back empty, before
+reporting a real miss.
 """
 
 from __future__ import annotations
@@ -126,9 +137,24 @@ def get_prices(
             return _error_result(drug_name, formulation, dosage, f"Cost Plus Drugs API request failed: {e}")
 
         if not rows:
+            # Confirmed live: this API does exact-string matching only, no
+            # fuzzy/substring/typo tolerance, and medication_name/brand_name
+            # are two disjoint fields — "Lipitor" has zero medication_name
+            # rows but four brand_name rows (the reverse of "Atorvastatin").
+            # A drug typed by its brand name would otherwise report a false
+            # "not carried" even though Cost Plus Drugs stocks it. Retry
+            # against brand_name before giving up.
+            try:
+                rows = _api_get({"brand_name": drug_name})
+            except Exception as e:
+                return _error_result(drug_name, formulation, dosage, f"Cost Plus Drugs API request failed: {e}")
+
+        if not rows:
             return _error_result(
                 drug_name, formulation, dosage,
-                f"no Cost Plus Drugs catalog entry for '{drug_name}'",
+                f"no Cost Plus Drugs catalog entry for '{drug_name}' (checked both "
+                "generic and brand name — the API requires an exact match, no "
+                "fuzzy/typo tolerance)",
             )
 
         # Form first, then strength — same priority order the old
