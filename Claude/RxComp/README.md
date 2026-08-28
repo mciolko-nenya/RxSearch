@@ -2168,6 +2168,51 @@ live" caveat elsewhere in this file: an explicit, dated shipping figure
 in the label is safer than an undated one folded invisibly into the
 headline price.
 
+**`gui.py` now triggers a refresh on its own** when the cache is missing
+or stale, instead of requiring someone to remember to run
+`costplusdrugs_shipping.py` by hand. Refreshing means driving a real
+Chrome session, so this is deliberately fire-and-forget: `gui.py` never
+blocks a price lookup on it — a request whose cache just went stale
+still gets an answer immediately (with whatever caveat the current cache
+state produces), while a background thread updates the file for the
+*next* lookup.
+
+Triggered from three places: at server startup (if `costplusdrugs` is
+enabled at all), and from both `/api/search` and `/api/v1/prices`
+whenever `costplusdrugs` is among the requested sites — so a long-running
+server stays current even without a restart. Two separate guards keep
+this from misbehaving:
+- `_shipping_refresh_lock` dedupes concurrent triggers — two requests
+  noticing a stale cache at the same moment don't launch two Chrome
+  sessions.
+- A one-hour cooldown (`SHIPPING_REFRESH_RETRY_SECONDS`), independent of
+  whether the last attempt succeeded — without it, a host with no
+  Chrome/display at all (e.g. a from-scratch deployment before Chrome is
+  installed) would retry, and fail, on *every single request*.
+
+The background refresh still goes through `_run_lock` — the same
+process-wide lock that already serializes every Selenium-touching
+operation in this file — so it queues behind (rather than races) a
+concurrent GoodRx/SingleCare/Amazon search or Amazon-setup, exactly like
+every other Selenium use here.
+
+Confirmed live, end-to-end: forced the cache to look 200+ days stale,
+called the trigger directly — it correctly detected staleness, launched
+exactly one background Chrome session (a concurrent second call was
+deduped, not queued as a duplicate), got past Cloudflare headlessly, and
+wrote back a fresh `$5.25` with an updated timestamp. Confirmed
+separately that a fresh cache is a true no-op (no thread spawned at
+all), and that hitting the real `/api/v1/prices?drug=lisinopril&dosage=
+20mg&sites=costplusdrugs` route through Flask's own test client reflects
+the newly-refreshed fee in that same request's `price_label`.
+
+A failed refresh (no Chrome installed, network error, page structure
+changed) is only logged server-side, never surfaced as an error to
+whatever price lookup happened to trigger it — `costplusdrugs_scraper.py`
+'s own price_label caveat already covers "no fee cached yet" or "cache is
+stale" gracefully on its own, so a failed background refresh just means
+that caveat keeps showing until a later attempt succeeds.
+
 ### Cost Plus Drugs: search, then strength/quantity selection *(retired — historical)*
 
 Previously built directly from drug name + dosage + form

@@ -45,14 +45,18 @@ from __future__ import annotations
 import contextlib
 import os
 import threading
+import time
 import webbrowser
 from dataclasses import asdict
+from datetime import datetime, timezone
 
 from flask import Flask, jsonify, render_template_string, request
 
 import driver_utils
 import main
 from config import Config
+from costplusdrugs_scraper import STALE_SHIPPING_FEE_DAYS
+from costplusdrugs_shipping import load_shipping_fee, update_shipping_fee
 
 app = Flask(__name__)
 _scrapers_loaded = False
@@ -141,6 +145,86 @@ class GuiChallengeNotifier(driver_utils.ChallengeNotifier):
 gui_notifier = GuiChallengeNotifier()
 driver_utils.set_challenge_notifier(gui_notifier)
 _run_lock = threading.Lock()
+
+# Cost Plus Drugs' shipping fee (see costplusdrugs_shipping.py) is cached
+# in a small local file rather than looked up live on every price
+# request — refreshing it means driving a real Chrome session, so this
+# GUI does that in the background instead of ever blocking a price
+# lookup on it. Two separate guards, not one:
+#   - _shipping_refresh_lock stops two requests noticing a stale/missing
+#     cache at the same moment from both launching a Chrome session for
+#     the same refresh.
+#   - _last_shipping_refresh_attempt is a cooldown, independent of
+#     whether the last attempt succeeded — a host with no Chrome/display
+#     at all (e.g. a from-scratch deployment before Chrome is installed)
+#     would otherwise retry, and fail, on every single request.
+_shipping_refresh_lock = threading.Lock()
+_last_shipping_refresh_attempt: float | None = None
+SHIPPING_REFRESH_RETRY_SECONDS = 60 * 60  # 1 hour
+
+
+def _shipping_cache_is_stale() -> bool:
+    """Missing entirely counts as stale. Mirrors costplusdrugs_scraper.
+    py's own STALE_SHIPPING_FEE_DAYS threshold (imported, not
+    re-declared, so the two can't drift) and its "can't parse the
+    timestamp → treat as stale" handling — this triggers a refresh in
+    exactly the cases that module's price_label caveat would otherwise
+    have to warn about."""
+    record = load_shipping_fee()
+    if record is None:
+        return True
+    try:
+        checked_at = datetime.fromisoformat(record.checked_at)
+    except ValueError:
+        return True
+    return (datetime.now(timezone.utc) - checked_at).days > STALE_SHIPPING_FEE_DAYS
+
+
+def _maybe_refresh_costplusdrugs_shipping() -> None:
+    """Fire-and-forget: if the shipping-fee cache is missing or stale,
+    kicks off a background Chrome session to refresh it and returns
+    immediately either way — never raises, never blocks the caller. A
+    price lookup should never wait on this; costplusdrugs_scraper.py's
+    own price_label caveat already handles a missing/stale cache
+    gracefully, so a skipped or failed refresh here just means that
+    caveat keeps showing until a later attempt succeeds."""
+    global _last_shipping_refresh_attempt
+
+    if not _shipping_cache_is_stale():
+        return
+
+    now = time.monotonic()
+    if (
+        _last_shipping_refresh_attempt is not None
+        and now - _last_shipping_refresh_attempt < SHIPPING_REFRESH_RETRY_SECONDS
+    ):
+        return
+    if not _shipping_refresh_lock.acquire(blocking=False):
+        return  # a refresh is already in flight
+    _last_shipping_refresh_attempt = now
+
+    def _run():
+        try:
+            # Blocking acquire, not blocking=False: this runs on its own
+            # background thread, so waiting here just means "go after
+            # whatever GoodRx/SingleCare/Amazon search or Amazon-setup
+            # happens to be using Selenium right now" — the same
+            # process-wide serialization _run_lock already provides
+            # everywhere else, not a new restriction.
+            with _run_lock:
+                record = update_shipping_fee()
+            print(f"Cost Plus Drugs shipping fee refreshed: ${record.fee:.2f}")
+        except Exception as e:
+            # Never surfaced to whatever price lookup triggered this —
+            # see this function's docstring. Logged so a deployment
+            # missing Chrome/a display entirely (see README's Render
+            # section) is visible in server logs instead of silently
+            # retried forever with no trace.
+            print(f"Cost Plus Drugs shipping-fee refresh failed (will retry later): {e}")
+        finally:
+            _shipping_refresh_lock.release()
+
+    threading.Thread(target=_run, daemon=True).start()
 
 # Render (and most PaaS hosts) inject $PORT and expect the app to bind
 # 0.0.0.0 to it; a plain local `python gui.py` has neither set, so this
@@ -526,6 +610,9 @@ def api_v1_prices():
     else:
         sites = list(Config.ENABLED_SITES)
 
+    if "costplusdrugs" in sites:
+        _maybe_refresh_costplusdrugs_shipping()
+
     try:
         Config.validate()
     except ValueError as e:
@@ -595,6 +682,9 @@ def api_search():
             return jsonify({"error": "Drug and Dosage are both required."}), 400
         if not sites:
             return jsonify({"error": "Select at least one site."}), 400
+
+        if "costplusdrugs" in sites:
+            _maybe_refresh_costplusdrugs_shipping()
 
         try:
             Config.validate()
@@ -704,6 +794,13 @@ def api_challenge_confirm():
 
 
 def main_gui():
+    # Proactive, not just reactive: a fresh deployment (or a server that's
+    # been up long enough for the cache to go stale with no requests in
+    # between) gets a background refresh attempt right away, rather than
+    # waiting for the first Cost Plus Drugs request to trigger one.
+    if "costplusdrugs" in Config.ENABLED_SITES:
+        _maybe_refresh_costplusdrugs_shipping()
+
     if _DEPLOYED:
         print(f"RxComp GUI running on {HOST}:{PORT}")
     else:
