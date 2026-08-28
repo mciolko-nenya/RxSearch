@@ -8,11 +8,6 @@
 # Debug HTML snapshots dumped by scrapers on unexpected pages
 page_*.html
 
-# Locally-cached Cost Plus Drugs shipping fee (see costplusdrugs_shipping.py) —
-# regenerate with `python costplusdrugs_shipping.py`, don't commit a snapshot
-# that will just go stale.
-costplusdrugs_shipping.json
-
 # Python
 __pycache__/
 *.py[cod]
