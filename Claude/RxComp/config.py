@@ -71,6 +71,18 @@ class Config:
         "TeamCubanCard_DownloadableMedicationList_08.06.2026.xlsx",
     )
 
+    # Path (relative to repo root, or absolute) to the cached record of
+    # Cost Plus Drugs' standard shipping fee — not returned by their API
+    # (see costplusdrugs_scraper.py's docstring) and only readable by
+    # driving a real browser (see costplusdrugs_shipping.py's docstring
+    # for why). Written by `python costplusdrugs_shipping.py` /
+    # `python main.py --update-costplusdrugs-shipping`, read by
+    # costplusdrugs_scraper.py's get_prices() on every lookup. Missing or
+    # unreadable is treated as "no cached fee yet", not an error.
+    COSTPLUSDRUGS_SHIPPING_PATH = os.getenv(
+        "COSTPLUSDRUGS_SHIPPING_PATH", "costplusdrugs_shipping.json"
+    )
+
     # GoodRx frequently shows an interactive bot-check (a PerimeterX
     # px-captcha widget, sometimes a Cloudflare-style challenge instead) —
     # something no headless session can solve, since no human is looking at
@@ -142,6 +154,7 @@ if __name__ == "__main__":
             "ENABLED_SITES",
             "COSTPLUSDRUGS_LOOKUP_MODE",
             "COSTPLUSDRUGS_FORMULARY_PATH",
+            "COSTPLUSDRUGS_SHIPPING_PATH",
             "GOODRX_INTERACTIVE_CAPTCHA",
             "SINGLECARE_INTERACTIVE_CAPTCHA",
         ):

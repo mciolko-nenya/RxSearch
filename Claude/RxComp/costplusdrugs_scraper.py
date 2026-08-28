@@ -73,22 +73,58 @@ true edit-distance/typo fuzzy matching on top of this — real drug names
 are frequently one or two characters apart from a *different* real drug
 (the same reasoning that kept amazon_scraper.py's drug-name matching
 exact rather than fuzzy).
+
+Separately, confirmed live in a real browser: `url` points to the right
+drug page but the wrong quantity on load — e.g. requesting 90-count
+returns a URL that always displays 30-count pricing when opened. Root
+cause confirmed on Cost Plus Drugs' own site: its product page has no
+URL that encodes a specific quantity at all — clicking its own "90
+Count" button updates the on-page price (to the same $ figure this API's
+`quantity_units=90` returns) but never changes the URL, query string, or
+hash. So `url` here is already the single most specific link that exists
+for a given drug+strength+form — there's no more-specific one to switch
+to. `get_prices()` now appends a caveat to `price_label` whenever the
+requested quantity isn't the page's own default (confirmed live, always
+30) so the mismatch is surfaced instead of left silently misleading.
+
+The shipping fee itself is now surfaced too, when known: see
+costplusdrugs_shipping.py for how it's kept as a small, separately
+and periodically refreshed local file (its own module docstring explains
+why this couldn't just be one more field this API returns — the fee
+lives behind a real browser-only Cloudflare challenge). `get_prices()`
+reads that cache via `load_shipping_fee()` — a plain file read, no
+Selenium — and states the last-known fee and how long ago it was
+checked directly in `price_label`, rather than leaving the caveat as a
+vague "not returned by this API" with no number attached. A cache older
+than STALE_SHIPPING_FEE_DAYS gets an explicit staleness warning instead
+of being presented as current.
 """
 
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 
 import requests
 
 from config import Config
 from costplusdrugs_formulary import find_entry, load_formulary
+from costplusdrugs_shipping import load_shipping_fee
 from models import PriceResult
 from utils import extract_price_from_text, token_matches
 
 SOURCE_NAME = "Cost Plus Drugs"
 
 API_BASE_URL = "https://us-central1-costplusdrugs-publicapi.cloudfunctions.net/main"
+
+# Confirmed live: Cost Plus Drugs' shipping fee has been unchanged ($5.25)
+# across every check made during this project's history so far, across
+# different drugs and quantities — a flat, rarely-changing fee, not
+# something that needs re-checking constantly. This is a "the caller
+# should know this might be out of date" threshold, not a hard cutoff:
+# crossing it downgrades the price_label caveat's wording, it never
+# blocks or invalidates the result.
+STALE_SHIPPING_FEE_DAYS = 180
 
 # Deliberately only true salt/counterion words — never release-timing
 # modifiers ("ER"/"XR"/"XL"/"SR"/"CR"/"DR"/"extended release"/"delayed
@@ -180,6 +216,45 @@ def _salt_stripped_lookup(drug_name: str) -> tuple[list[dict], str | None, list[
     field_used = matching_names[resolved_name]
     rows = [r for r in catalog if r.get(field_used) == resolved_name]
     return rows, resolved_name, []
+
+
+def _shipping_fee_caveat() -> str:
+    """Builds the shipping half of every price_label. Reads
+    costplusdrugs_shipping.py's cached fee (a plain file read — never
+    touches a browser itself) and states the concrete last-known number
+    and how long ago it was checked, rather than the old vague "not
+    returned by this API" with no figure attached. Falls back to that
+    vague wording, plus a pointer to the updater, only when no cache
+    file exists yet."""
+    record = load_shipping_fee()
+    if record is None:
+        return (
+            "excludes Cost Plus Drugs' flat standard shipping fee, charged "
+            "separately at checkout and not returned by this API (run "
+            "costplusdrugs_shipping.py to cache the current fee)"
+        )
+
+    try:
+        checked_at = datetime.fromisoformat(record.checked_at)
+        age_days = (datetime.now(timezone.utc) - checked_at).days
+    except ValueError:
+        age_days = None
+
+    caveat = (
+        f"excludes Cost Plus Drugs' flat standard shipping fee "
+        f"(${record.fee:.2f} as of last check"
+    )
+    if age_days is not None:
+        caveat += f", {age_days} day{'s' if age_days != 1 else ''} ago"
+    caveat += "; not returned by this API), charged separately at checkout"
+    if age_days is not None and age_days > STALE_SHIPPING_FEE_DAYS:
+        caveat += (
+            f" — ⚠ that check is over {STALE_SHIPPING_FEE_DAYS} days old, "
+            "the fee may have changed since; run costplusdrugs_shipping.py "
+            "to refresh it"
+        )
+    return caveat
+
 
 # Cost Plus Drugs' own page used to state its default pack size in plain
 # sentence form ("A 30 count supply of ... will cost:"), varying per
@@ -349,11 +424,25 @@ def get_prices(
         if price is None:
             return _error_result(drug_name, formulation, dosage, "no price returned by Cost Plus Drugs' API", url)
 
-        label = (
-            "cash price (no insurance) — excludes Cost Plus Drugs' flat "
-            "standard shipping fee, charged separately at checkout and not "
-            "returned by this API"
-        )
+        label = f"cash price (no insurance) — {_shipping_fee_caveat()}"
+        if quantity_units != DEFAULT_QUANTITY_UNITS:
+            # Confirmed live in the browser: Cost Plus Drugs' own product
+            # page has no URL that encodes a specific quantity at all —
+            # clicking its "90 Count" button updates the on-page price (to
+            # the same $ figure this API's quantity_units=90 returns) but
+            # never changes the URL, query string, or hash. So `url` here
+            # is already the most specific link that exists for this drug,
+            # but it will always land on the page's own default view
+            # (confirmed always 30, matching DEFAULT_QUANTITY_UNITS above)
+            # regardless of what quantity was actually requested/quoted —
+            # surfaced here rather than leaving the mismatch silent.
+            label += (
+                f"; note: the linked page defaults to showing "
+                f"{DEFAULT_QUANTITY_UNITS}-count pricing — there is no "
+                f"quantity-specific URL on Cost Plus Drugs' site, so "
+                f"you'll need to reselect '{quantity_units} Count' there "
+                "yourself to see this quote reflected on the page"
+            )
         if resolved_via_salt_strip:
             # Never substitute silently — same "wrong drug is worse than no
             # drug" philosophy as the hard-exclude formulation/dosage

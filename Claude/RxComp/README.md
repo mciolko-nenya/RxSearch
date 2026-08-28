@@ -2079,6 +2079,95 @@ lower-confidence typo-matching layer could still be added later if
 needed, but only ever as a set of surfaced suggestions to choose from,
 never as a silent auto-pick.
 
+**`url` points to the right drug, but always the wrong quantity when
+one was actually requested.** Reported: a 90-count request's `url`
+opened to a page showing 30-count pricing. Confirmed live in a real
+browser session (not just reading the API's own fields) why: Cost Plus
+Drugs' product page has **no URL that encodes a specific quantity at
+all**. Clicking its own "90 Count" button in the on-page "Price
+Calculator" correctly updates the displayed price — to `$7.17`, the
+exact same figure this project's own `quantity_units=90` API call
+returns — but the URL, query string, and hash all stay completely
+unchanged. So `url` here was never wrong, exactly — it's already the
+single most specific link Cost Plus Drugs' own site has for a given
+drug+strength+form — it just always lands on the site's own default
+view (confirmed live: always 30, matching `DEFAULT_QUANTITY_UNITS`
+above) regardless of what was actually requested/quoted. `get_prices()`
+now appends a caveat to `price_label` whenever the requested quantity
+isn't 30, so a caller isn't left assuming the linked page will already
+reflect the quote it just returned:
+`"...; note: the linked page defaults to showing 30-count pricing —
+there is no quantity-specific URL on Cost Plus Drugs' site, so you'll
+need to reselect '90 Count' there yourself..."` — confirmed live via
+`get_prices("Atorvastatin", "tablet", "40mg", quantity="90")`.
+
+### Cost Plus Drugs: shipping fee, kept as a small periodically-refreshed file
+
+Asked directly: does the API return the shipping fee? No — confirmed
+earlier, its `requested_quote` is drug-only, no shipping field anywhere
+in the response. The fee is disclosed on the real product page as its
+own line ("Standard Shipping *Additional cost at checkout $5.25"), but
+getting *that* live isn't as simple as a plain HTTP request: confirmed
+live that the page sits behind a genuine Cloudflare JS challenge — even
+a `curl` request with a realistic Chrome User-Agent and standard headers
+still gets an HTTP 403 "Just a moment..." interstitial. Reading this one
+number at all requires a real browser, same as the Selenium
+infrastructure this project moved Cost Plus Drugs' own price lookups
+*away* from — so rather than reintroduce that into every price lookup,
+it's kept narrowly scoped to just this fee and refreshed occasionally
+instead of live per-request.
+
+**`costplusdrugs_shipping.py`** (new module) has two halves:
+- `update_shipping_fee()` — drives a real Chrome session (reusing
+  `driver_utils`' existing undetected-chromedriver setup, the same one
+  GoodRx/SingleCare/Amazon still use) to load a live product page and
+  read the fee straight off it, then writes `{fee, checked_at,
+  checked_url}` to a small JSON file (`costplusdrugs_shipping.json` by
+  default — `COSTPLUSDRUGS_SHIPPING_PATH` to override). Confirmed live,
+  twice in this session: got past the Cloudflare challenge *headlessly*,
+  no interactive CAPTCHA-solve needed, same as this project's original
+  Selenium-based Cost Plus Drugs scraper's history — and both runs read
+  back exactly **$5.25**, matching every prior confirmed-live figure
+  this project has recorded for this fee.
+- `load_shipping_fee()` — the cheap, non-Selenium read
+  `costplusdrugs_scraper.py`'s `get_prices()` calls on every lookup. Just
+  a plain file read; never touches a browser. Returns `None` (never
+  raises) when the file doesn't exist yet or is unreadable/malformed.
+
+**Refreshing it — run manually, or point a cron/launchd job at it:**
+```bash
+python costplusdrugs_shipping.py                    # headless (default)
+python costplusdrugs_shipping.py --debug            # visible Chrome window
+python main.py --update-costplusdrugs-shipping      # same thing, via main.py
+```
+There's no built-in scheduler — this project doesn't run a background
+process. Cost Plus Drugs' shipping fee changes rarely (confirmed live:
+unchanged $5.25 across every check this project has ever made, across
+different drugs, quantities, and now two separate runs of this new
+updater), so checking every few months is almost certainly enough.
+
+**The cache's own age is what keeps this honest**, rather than trusting
+an old number forever: every `price_label` now states the concrete cached
+fee and how many days old that check is —
+`"...excludes Cost Plus Drugs' flat standard shipping fee ($5.25 as of
+last check, 0 days ago; not returned by this API), charged separately at
+checkout"` — confirmed live for a fresh cache. Confirmed live for a
+deliberately-aged one, too: once the cache passes
+`STALE_SHIPPING_FEE_DAYS` (180), the same caveat gets an explicit warning
+appended instead of silently presenting a possibly-outdated number as
+current: `"— ⚠ that check is over 180 days old, the fee may have changed
+since; run costplusdrugs_shipping.py to refresh it"`. When no cache file
+exists at all yet, the caveat falls back to the original wording plus a
+pointer to the updater, rather than erroring or silently omitting the
+caveat.
+
+`price` itself is deliberately left unchanged by any of this — it's
+still just the drug price, not `price + shipping` — same reasoning as
+every other "don't silently bake in a number this version can't verify
+live" caveat elsewhere in this file: an explicit, dated shipping figure
+in the label is safer than an undated one folded invisibly into the
+headline price.
+
 ### Cost Plus Drugs: search, then strength/quantity selection *(retired — historical)*
 
 Previously built directly from drug name + dosage + form
