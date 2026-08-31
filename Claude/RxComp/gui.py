@@ -42,15 +42,21 @@ than the threading this now needs for the modal to work at all.
 
 from __future__ import annotations
 
+import contextlib
+import os
 import threading
+import time
 import webbrowser
 from dataclasses import asdict
+from datetime import datetime, timezone
 
 from flask import Flask, jsonify, render_template_string, request
 
 import driver_utils
 import main
 from config import Config
+from costplusdrugs_scraper import STALE_SHIPPING_FEE_DAYS
+from costplusdrugs_shipping import load_shipping_fee, update_shipping_fee
 
 app = Flask(__name__)
 _scrapers_loaded = False
@@ -140,7 +146,93 @@ gui_notifier = GuiChallengeNotifier()
 driver_utils.set_challenge_notifier(gui_notifier)
 _run_lock = threading.Lock()
 
-PORT = 5057
+# Cost Plus Drugs' shipping fee (see costplusdrugs_shipping.py) is cached
+# in a small local file rather than looked up live on every price
+# request — refreshing it means driving a real Chrome session, so this
+# GUI does that in the background instead of ever blocking a price
+# lookup on it. Two separate guards, not one:
+#   - _shipping_refresh_lock stops two requests noticing a stale/missing
+#     cache at the same moment from both launching a Chrome session for
+#     the same refresh.
+#   - _last_shipping_refresh_attempt is a cooldown, independent of
+#     whether the last attempt succeeded — a host with no Chrome/display
+#     at all (e.g. a from-scratch deployment before Chrome is installed)
+#     would otherwise retry, and fail, on every single request.
+_shipping_refresh_lock = threading.Lock()
+_last_shipping_refresh_attempt: float | None = None
+SHIPPING_REFRESH_RETRY_SECONDS = 60 * 60  # 1 hour
+
+
+def _shipping_cache_is_stale() -> bool:
+    """Missing entirely counts as stale. Mirrors costplusdrugs_scraper.
+    py's own STALE_SHIPPING_FEE_DAYS threshold (imported, not
+    re-declared, so the two can't drift) and its "can't parse the
+    timestamp → treat as stale" handling — this triggers a refresh in
+    exactly the cases that module's price_label caveat would otherwise
+    have to warn about."""
+    record = load_shipping_fee()
+    if record is None:
+        return True
+    try:
+        checked_at = datetime.fromisoformat(record.checked_at)
+    except ValueError:
+        return True
+    return (datetime.now(timezone.utc) - checked_at).days > STALE_SHIPPING_FEE_DAYS
+
+
+def _maybe_refresh_costplusdrugs_shipping() -> None:
+    """Fire-and-forget: if the shipping-fee cache is missing or stale,
+    kicks off a background Chrome session to refresh it and returns
+    immediately either way — never raises, never blocks the caller. A
+    price lookup should never wait on this; costplusdrugs_scraper.py's
+    own price_label caveat already handles a missing/stale cache
+    gracefully, so a skipped or failed refresh here just means that
+    caveat keeps showing until a later attempt succeeds."""
+    global _last_shipping_refresh_attempt
+
+    if not _shipping_cache_is_stale():
+        return
+
+    now = time.monotonic()
+    if (
+        _last_shipping_refresh_attempt is not None
+        and now - _last_shipping_refresh_attempt < SHIPPING_REFRESH_RETRY_SECONDS
+    ):
+        return
+    if not _shipping_refresh_lock.acquire(blocking=False):
+        return  # a refresh is already in flight
+    _last_shipping_refresh_attempt = now
+
+    def _run():
+        try:
+            # Blocking acquire, not blocking=False: this runs on its own
+            # background thread, so waiting here just means "go after
+            # whatever GoodRx/SingleCare/Amazon search or Amazon-setup
+            # happens to be using Selenium right now" — the same
+            # process-wide serialization _run_lock already provides
+            # everywhere else, not a new restriction.
+            with _run_lock:
+                record = update_shipping_fee()
+            print(f"Cost Plus Drugs shipping fee refreshed: ${record.fee:.2f}")
+        except Exception as e:
+            # Never surfaced to whatever price lookup triggered this —
+            # see this function's docstring. Logged so a deployment
+            # missing Chrome/a display entirely (see README's Render
+            # section) is visible in server logs instead of silently
+            # retried forever with no trace.
+            print(f"Cost Plus Drugs shipping-fee refresh failed (will retry later): {e}")
+        finally:
+            _shipping_refresh_lock.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+
+# Render (and most PaaS hosts) inject $PORT and expect the app to bind
+# 0.0.0.0 to it; a plain local `python gui.py` has neither set, so this
+# also doubles as the "are we deployed, not local" signal used below to
+# skip the local-only browser auto-open.
+_DEPLOYED = "PORT" in os.environ
+PORT = int(os.environ.get("PORT", 5057))
+HOST = os.environ.get("HOST", "0.0.0.0" if _DEPLOYED else "127.0.0.1")
 
 PAGE = """<!doctype html>
 <html lang="en">
@@ -217,15 +309,17 @@ PAGE = """<!doctype html>
   </div>
 
   <div class="sites">
-    {% for site in all_sites %}
-    <label><input type="checkbox" class="site-checkbox" value="{{ site }}" {% if site in enabled_sites %}checked{% endif %}> {{ site }}</label>
+    {% for site in available_sites %}
+    <label><input type="checkbox" class="site-checkbox" value="{{ site }}" checked> {{ site }}</label>
     {% endfor %}
     <label><input type="checkbox" id="debug"> Debug (visible browser)</label>
   </div>
 
   <div class="actions">
     <button type="submit" id="search-btn">Search</button>
+    {% if 'amazon' in available_sites %}
     <button type="button" class="secondary" id="setup-amazon-btn">Set up Amazon login…</button>
+    {% endif %}
     <span id="status"></span>
   </div>
 </form>
@@ -258,7 +352,9 @@ const challengeDoneBtn = document.getElementById('challenge-done-btn');
 
 function setBusy(busy) {
   searchBtn.disabled = busy;
-  setupBtn.disabled = busy;
+  // setupBtn is null when amazon isn't in this deployment's ENABLED_SITES
+  // — the template omits the button entirely rather than just disabling it.
+  if (setupBtn) setupBtn.disabled = busy;
 }
 
 // Polls for a pending challenge the whole time the page is open, not
@@ -380,24 +476,28 @@ form.addEventListener('submit', async (e) => {
   }
 });
 
-setupBtn.addEventListener('click', async () => {
-  setBusy(true);
-  setStatus('Opening Chrome for Amazon login — log in there, then click Done in the box ' +
-             'that pops up here.');
-  try {
-    const resp = await fetch('/api/setup-amazon', {method: 'POST'});
-    const data = await resp.json();
-    if (!resp.ok) {
-      setStatus(data.error || 'Amazon setup failed.', true);
-    } else {
-      setStatus('Amazon login saved. You can now include amazon in searches.');
+// setupBtn is null when amazon isn't in this deployment's ENABLED_SITES —
+// the template omits the whole button, so there's nothing to wire up.
+if (setupBtn) {
+  setupBtn.addEventListener('click', async () => {
+    setBusy(true);
+    setStatus('Opening Chrome for Amazon login — log in there, then click Done in the box ' +
+               'that pops up here.');
+    try {
+      const resp = await fetch('/api/setup-amazon', {method: 'POST'});
+      const data = await resp.json();
+      if (!resp.ok) {
+        setStatus(data.error || 'Amazon setup failed.', true);
+      } else {
+        setStatus('Amazon login saved. You can now include amazon in searches.');
+      }
+    } catch (err) {
+      setStatus('Amazon setup failed: ' + err, true);
+    } finally {
+      setBusy(false);
     }
-  } catch (err) {
-    setStatus('Amazon setup failed: ' + err, true);
-  } finally {
-    setBusy(false);
-  }
-});
+  });
+}
 </script>
 </body>
 </html>
@@ -406,10 +506,155 @@ setupBtn.addEventListener('click', async () => {
 
 @app.route("/")
 def index():
+    # Deliberately Config.ENABLED_SITES here, not Config.ALL_SITES: a
+    # site this deployment has disabled (e.g. a Cost-Plus-Drugs-only
+    # Render deployment with ENABLED_SITES=costplusdrugs, which has no
+    # Chrome/display to run the other three sites' Selenium flows at
+    # all) shouldn't even be offered as a checkbox — see api_search()'s
+    # matching restriction below for why offering it would be worse than
+    # just confusing.
     return render_template_string(
-        PAGE, all_sites=Config.ALL_SITES, enabled_sites=Config.ENABLED_SITES,
+        PAGE, available_sites=Config.ENABLED_SITES, enabled_sites=Config.ENABLED_SITES,
         default_zip=Config.DEFAULT_ZIP_CODE or "",
     )
+
+
+#: Sites whose get_prices() drives a real Selenium browser and can show
+#: an interactive CAPTCHA — see _captcha_disabled_for_api() below for why
+#: that matters specifically for /api/v1/prices, not for the GUI's own
+#: /api/search.
+SELENIUM_SITES = {"goodrx", "singlecare", "amazon"}
+
+
+@contextlib.contextmanager
+def _captcha_disabled_for_api():
+    """A programmatic API caller has no visible Chrome window to solve a
+    CAPTCHA in and no "Done" button to click — unlike the GUI, which
+    exists specifically to give a human both of those (see this module's
+    docstring). Left as-is, a challenged site would just block an API
+    request for the full CHALLENGE_TIMEOUT_SECONDS (30 minutes) with no
+    one ever able to answer the prompt, then finally report a timeout —
+    the worst possible version of "this site is unavailable right now."
+    Forcing both interactive-CAPTCHA flags off for the duration of an
+    /api/v1/prices call instead makes a challenged site fail fast with a
+    normal, same-shape PriceResult error, exactly like any other lookup
+    failure.
+
+    Config.GOODRX_INTERACTIVE_CAPTCHA/SINGLECARE_INTERACTIVE_CAPTCHA are
+    shared class attributes, not per-request state, so this saves and
+    restores the originals afterward rather than leaving them forced off
+    — otherwise a GUI search that starts concurrently (or right after)
+    would silently lose its own human-in-the-loop CAPTCHA solving too.
+    Safe to overlap with the GUI's own use of these flags only because
+    every caller of this — like every caller that touches a Selenium
+    site at all — is expected to be holding _run_lock first; see
+    api_v1_prices()."""
+    prev_goodrx = Config.GOODRX_INTERACTIVE_CAPTCHA
+    prev_singlecare = Config.SINGLECARE_INTERACTIVE_CAPTCHA
+    Config.GOODRX_INTERACTIVE_CAPTCHA = False
+    Config.SINGLECARE_INTERACTIVE_CAPTCHA = False
+    try:
+        yield
+    finally:
+        Config.GOODRX_INTERACTIVE_CAPTCHA = prev_goodrx
+        Config.SINGLECARE_INTERACTIVE_CAPTCHA = prev_singlecare
+
+
+@app.route("/api/v1/sites")
+def api_v1_sites():
+    """Lets a programmatic caller discover what's actually queryable on
+    this deployment without hard-coding site names — e.g. a Cost-Plus-
+    Drugs-only Render deployment (see README.md's "Deploying to
+    Render.com") reports just that one site here, matching exactly what
+    /api/v1/prices will accept."""
+    return jsonify({"sites": list(Config.ENABLED_SITES)})
+
+
+@app.route("/api/v1/prices")
+def api_v1_prices():
+    """The documented, stable JSON API — see README.md's "API" section.
+    Deliberately a separate route from /api/search rather than a
+    reskin of it: that one is this GUI page's own internal
+    implementation detail (POST, JSON body, a `debug` flag meaningful
+    only to a person watching the browser) and is free to change
+    alongside the page; this one is the public contract external
+    callers should be able to rely on — GET with plain query
+    parameters, so it's curl/browser-address-bar friendly, and no
+    `debug` option (an API caller has no visible browser to watch
+    regardless)."""
+    drug_name = (request.args.get("drug") or "").strip()
+    dosage = (request.args.get("dosage") or "").strip()
+    formulation = (request.args.get("formulation") or "").strip() or "tablet"
+    quantity = (request.args.get("quantity") or "").strip() or None
+    zip_code = (request.args.get("zip") or "").strip() or None
+
+    if not drug_name or not dosage:
+        return jsonify({"error": "'drug' and 'dosage' query parameters are both required."}), 400
+
+    sites_param = request.args.get("sites")
+    if sites_param:
+        requested = [s.strip() for s in sites_param.split(",") if s.strip()]
+        # Config.ENABLED_SITES, not Config.ALL_SITES — same enforcement
+        # point as /api/search's identical restriction, and for the same
+        # reason: a deployment that disabled a site (no Chrome installed
+        # for it at all, e.g. a Cost-Plus-Drugs-only Render deployment)
+        # must actually refuse it here, not just leave it off a UI this
+        # endpoint doesn't have.
+        unknown = [s for s in requested if s not in Config.ENABLED_SITES]
+        if unknown:
+            return jsonify({
+                "error": f"unknown or disabled site(s): {', '.join(unknown)} "
+                         f"(available: {', '.join(Config.ENABLED_SITES)})"
+            }), 400
+        sites = requested
+    else:
+        sites = list(Config.ENABLED_SITES)
+
+    if "costplusdrugs" in sites:
+        _maybe_refresh_costplusdrugs_shipping()
+
+    try:
+        Config.validate()
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    global _scrapers_loaded
+    if not _scrapers_loaded:
+        main._load_scrapers()
+        _scrapers_loaded = True
+
+    # Only the three Selenium-based sites need _run_lock at all (it
+    # exists to keep two browser sessions from launching at once — see
+    # this module's docstring) — a Cost-Plus-Drugs-only request never
+    # touches Selenium and would otherwise queue behind an unrelated
+    # GoodRx/SingleCare/Amazon lookup for no reason. Real concurrency
+    # only matters for that fast, lock-free path; the Selenium sites are
+    # already serialized with the GUI's own searches for a real reason
+    # (shared browser/profile state), so this doesn't try to improve on
+    # that beyond skipping it when it isn't needed at all.
+    needs_lock = bool(set(sites) & SELENIUM_SITES)
+
+    def _run_pipeline():
+        results = main.gather_results(sites, drug_name, formulation, dosage, zip_code, quantity, sequential=True)
+        results = main.filter_out_insurance_required(results)
+        results = main.normalize_quantities(results, quantity)
+        return main.sort_results(results)
+
+    try:
+        if needs_lock:
+            if not _run_lock.acquire(blocking=False):
+                return jsonify({"error": "A search or Amazon setup is already running — try again shortly."}), 409
+            try:
+                with _captcha_disabled_for_api():
+                    results = _run_pipeline()
+            finally:
+                _run_lock.release()
+        else:
+            results = _run_pipeline()
+    except Exception as e:
+        return jsonify({"error": f"unexpected error: {e}"}), 500
+
+    return jsonify({"results": [asdict(r) for r in results]})
 
 
 @app.route("/api/search", methods=["POST"])
@@ -425,12 +670,21 @@ def api_search():
         formulation = (payload.get("formulation") or "").strip() or "tablet"
         quantity = (payload.get("quantity") or "").strip() or None
         zip_code = (payload.get("zip") or "").strip() or None
-        sites = [s for s in (payload.get("sites") or []) if s in Config.ALL_SITES]
+        # Config.ENABLED_SITES, not Config.ALL_SITES: this is the actual
+        # enforcement point. Without it, a client could still POST
+        # {"sites": ["goodrx"]} on a deployment that deliberately
+        # disabled every Selenium-based site (e.g. no Chrome installed
+        # at all) regardless of what the rendered checkboxes offer —
+        # the template restriction above is only the UI half of this.
+        sites = [s for s in (payload.get("sites") or []) if s in Config.ENABLED_SITES]
 
         if not drug_name or not dosage:
             return jsonify({"error": "Drug and Dosage are both required."}), 400
         if not sites:
             return jsonify({"error": "Select at least one site."}), 400
+
+        if "costplusdrugs" in sites:
+            _maybe_refresh_costplusdrugs_shipping()
 
         try:
             Config.validate()
@@ -481,6 +735,12 @@ def api_search():
 
 @app.route("/api/setup-amazon", methods=["POST"])
 def api_setup_amazon():
+    # Same restriction as api_search()'s site filter, for the same
+    # reason: a deployment that disabled amazon (no Chrome/display to
+    # actually run its interactive login flow on) shouldn't let this
+    # route try anyway just because it was hit directly.
+    if "amazon" not in Config.ENABLED_SITES:
+        return jsonify({"error": "Amazon is not enabled on this deployment (amazon not in ENABLED_SITES)."}), 403
     if not _run_lock.acquire(blocking=False):
         return jsonify({"error": "A search or Amazon setup is already running — wait for it to finish."}), 409
     try:
@@ -534,9 +794,19 @@ def api_challenge_confirm():
 
 
 def main_gui():
-    url = f"http://127.0.0.1:{PORT}"
-    print(f"RxComp GUI running at {url} — opening your browser...")
-    threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    # Proactive, not just reactive: a fresh deployment (or a server that's
+    # been up long enough for the cache to go stale with no requests in
+    # between) gets a background refresh attempt right away, rather than
+    # waiting for the first Cost Plus Drugs request to trigger one.
+    if "costplusdrugs" in Config.ENABLED_SITES:
+        _maybe_refresh_costplusdrugs_shipping()
+
+    if _DEPLOYED:
+        print(f"RxComp GUI running on {HOST}:{PORT}")
+    else:
+        url = f"http://127.0.0.1:{PORT}"
+        print(f"RxComp GUI running at {url} — opening your browser...")
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     # threaded=True is required now, not just nice-to-have: a search or
     # Amazon-setup request can sit blocked inside
     # wait_for_challenge_confirmation() for as long as a challenge modal
@@ -544,7 +814,7 @@ def main_gui():
     # /api/challenge/confirm *while that's happening* — an unthreaded dev
     # server could never serve those, and the modal's "Done" button would
     # have no way to actually reach the waiting thread.
-    app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True)
+    app.run(host=HOST, port=PORT, debug=False, threaded=True)
 
 
 if __name__ == "__main__":

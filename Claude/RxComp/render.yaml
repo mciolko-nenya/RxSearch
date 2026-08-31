@@ -1,0 +1,31 @@
+# Render Blueprint for a Cost-Plus-Drugs-only deployment of RxComp's GUI.
+#
+# Deliberately doesn't touch GoodRx/SingleCare/Amazon at all: those three
+# are Selenium-based and sometimes need a human to solve an interactive
+# CAPTCHA in a real, visible Chrome window on the same machine — neither
+# of which exists on a headless Render instance. ENABLED_SITES below is
+# what actually restricts this deployment to Cost Plus Drugs (a plain,
+# free, public HTTP API — see README.md's "Cost Plus Drugs: switched to
+# their own public API" section) — gui.py enforces it server-side, not
+# just by hiding the other checkboxes, so a direct API request for
+# another site is rejected too, not just the UI.
+#
+# Deploy via Render's dashboard: New -> Blueprint -> point at this repo.
+# Or set up the same thing by hand: New -> Web Service, Python runtime,
+# build command `pip install -r requirements.txt`, start command
+# `python gui.py`, and set the env vars below in the dashboard.
+services:
+  - type: web
+    name: rxcomp-costplusdrugs
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python gui.py
+    envVars:
+      - key: ENABLED_SITES
+        value: costplusdrugs
+      # Optional: a default ZIP to pre-fill in the GUI. Cost Plus Drugs
+      # itself ignores it (flat mail-order pricing, no ZIP variation) —
+      # only relevant if you ever re-enable one of the other sites.
+      - key: DEFAULT_ZIP_CODE
+        value: ""

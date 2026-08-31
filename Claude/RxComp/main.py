@@ -6,6 +6,7 @@ Usage:
     python main.py --drug metformin --dosage 500mg --sites goodrx,costplusdrugs
     python main.py --drug lisinopril --dosage 20mg --json > prices.json
     python main.py --setup-amazon
+    python main.py --update-costplusdrugs-shipping
 """
 
 from __future__ import annotations
@@ -84,6 +85,10 @@ def parse_args():
     parser.add_argument("--debug", action="store_true", help="Run browsers visibly, sequentially, and always dump debug HTML")
     parser.add_argument("--json", action="store_true", help="Output raw JSON instead of a table")
     parser.add_argument("--setup-amazon", action="store_true", help="One-time interactive Amazon login into a persistent Chrome profile")
+    parser.add_argument(
+        "--update-costplusdrugs-shipping", action="store_true",
+        help="Refresh the cached Cost Plus Drugs shipping fee (see costplusdrugs_shipping.py) and exit",
+    )
     return parser.parse_args()
 
 
@@ -263,8 +268,23 @@ def main():
         amazon_scraper.setup_amazon_profile()
         return
 
+    if args.update_costplusdrugs_shipping:
+        import costplusdrugs_shipping
+
+        record = costplusdrugs_shipping.update_shipping_fee(headless=not args.debug)
+        print(
+            f"Cost Plus Drugs standard shipping fee: ${record.fee:.2f} "
+            f"(checked {record.checked_at} against {record.checked_url})"
+        )
+        print(f"Written to {Config.COSTPLUSDRUGS_SHIPPING_PATH}")
+        return
+
     if not args.drug or not args.dosage:
-        print("Error: --drug and --dosage are required (unless using --setup-amazon)", file=sys.stderr)
+        print(
+            "Error: --drug and --dosage are required (unless using --setup-amazon or "
+            "--update-costplusdrugs-shipping)",
+            file=sys.stderr,
+        )
         sys.exit(2)
 
     try:

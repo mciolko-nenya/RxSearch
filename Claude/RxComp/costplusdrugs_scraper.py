@@ -1,560 +1,457 @@
 """
-Cost Plus Drugs scraper.
+Cost Plus Drugs price lookup.
 
-Drug name -> URL used to be built directly (utils.costplusdrugs_slug():
-{name}-{strength}-{form}) rather than through Cost Plus Drugs' own search.
-Switched to search-driven resolution (resolve_and_select() below) for the
-same reason singlecare_scraper.py's equivalent was: a directly-guessed
-slug can be wrong for a drug whose real page uses a different base name
-than expected (e.g. a salt-form qualifier) — there's no algorithmic way to
-know without asking the site. No matching failure has actually been
-confirmed live for Cost Plus Drugs specifically (its slug matched the
-plain drug name correctly for atorvastatin, the case that motivated this),
-but the same class of risk applies here as anywhere URLs encode a
-canonical drug name, so this closes it here too.
+Switched from Selenium screen-scraping to Cost Plus Drugs' own free,
+public JSON API. Researched and confirmed live before making this
+switch: of the four sources this project prices, Cost Plus Drugs is the
+*only* one with a genuinely self-serve API — no signup, no API key,
+documented at https://github.com/CostPlusDrugs/apidocs /
+https://costplusdrugs.github.io/apidocs/. GoodRx and SingleCare each
+have a real API too, but both are gated behind a business-partnership
+application (a sales/review process, reportedly requiring GoodRx's
+prior written consent for non-consumer-facing/non-commercial use) with
+no self-serve path for a personal project — those two, and Amazon
+Pharmacy (which has no pricing API at all — prescription drugs are
+explicitly excluded from Amazon's own Product Advertising/Creators API
+by its own policy), are still screen-scraped elsewhere in this project.
 
-Also confirmed live while building this: Cost Plus Drugs' own plain-fetch
-path is blocked outright now (matching what's already true for
-singlecare_scraper.py) — so this is Selenium-only, not a fallback.
+Verified live against the endpoint directly as part of that research:
+querying `medication_name=lisinopril`, taking its 20mg NDC, then
+`ndc=<that NDC>&quantity_units=30` returned `requested_quote: "$5.55"` —
+the exact dollar figure the old Selenium scraper's own confirmed-live
+comment recorded reading off the real page's "A 30 count supply of 20mg
+Lisinopril will cost: ... $5.55" sentence. That confirms `requested_quote`
+is the same pre-shipping "Your Drug Price With Us" figure the page
+itself shows, not a different number. It's still not the full checkout
+total, though: Cost Plus Drugs' site separately discloses a flat
+"Standard Shipping" fee at checkout (confirmed $5.25 as of that same
+live check, in the version of this file that scraped the page directly)
+which the API doesn't return at all. The old scraper folded that fee
+into `price` because it could re-read it live off the page every time;
+this version can't confirm it's still $5.25 without going back to
+scraping the very thing it's replacing, so it's called out as an
+explicit, honest caveat in `price_label` instead of silently baking in a
+number that could go stale.
 
-Confirmed live end-to-end: the search result link always lands on a
-drug's *default* dosage page (e.g. "/medications/atorvastatin-10mg-
-tablet/" regardless of what dosage was searched for) — it only confirms
-the correct base drug name, not dosage. Reaching a specific dosage/
-quantity uses that page's own selector buttons (confirmed live: plain
-<button data-testid="strength-selection-{dose}">/"quantity-selection-
-{count}">, not a dropdown — clicking either live-updates the price, and
-for strength, the URL, with no separate confirm step).
+Still uses the static Team Cuban Card formulary spreadsheet
+(costplusdrugs_formulary.py) as an optional fast pre-filter when
+COSTPLUSDRUGS_LOOKUP_MODE=file — unchanged by this switch; it answers a
+different question (is this drug on our own formulary list at all) than
+the live API call does, and the API call is cheap enough now that the
+pre-filter is more a "confirm it's a formulary drug" step than a
+meaningful performance optimization, but removing it wasn't asked for.
 
-When Config.COSTPLUSDRUGS_LOOKUP_MODE is "file" (default: "live"), a static
-formulary spreadsheet (see costplusdrugs_formulary.py) is checked first as a
-fast pre-filter: if the drug/dosage/formulation isn't carried at all, this
-skips the live site entirely. It's never a replacement for the live scrape
-above — the spreadsheet has no pricing, only what's carried — just a way to
-avoid pointless live lookups for drugs Cost Plus Drugs doesn't stock.
+Confirmed live, separately: this API does exact-string matching only —
+no fuzzy, substring, or typo tolerance, and it's case-insensitive but
+whitespace-sensitive (a stray leading/trailing space is a miss). More
+importantly, `medication_name` and `brand_name` are two disjoint fields:
+`medication_name=Lipitor` returns nothing, `brand_name=Lipitor` returns
+all 4 strengths; `medication_name=atorvastatin` is the reverse. A drug
+typed by its brand name would otherwise falsely report "not carried"
+even though Cost Plus Drugs stocks it — get_prices() now retries against
+brand_name whenever the medication_name lookup comes back empty, before
+reporting a real miss.
+
+A third, separate gap: "Atorvastatin Calcium" (salt name included) still
+missed both of the above, since the catalog's own medication_name for it
+is the bare "Atorvastatin" — confirmed live that catalog naming is
+inconsistent about this (252 of 872 unique medication_names *do* include
+a salt word, e.g. "Acebutolol HCl"; most don't). Fixed via
+_salt_stripped_lookup(): confirmed live that calling this API with *no*
+filter params returns its entire catalog (2,373 rows), which is fetched
+once, cached, and matched against after normalizing away pure salt
+words. Deliberately conservative: never strips release-timing words
+(ER/XR/DR/SR/CR — confirmed live those mark real, non-interchangeable
+products, e.g. "Metoprolol Tartrate" vs. "Metoprolol Extended Release
+(ER)"), and even pure-salt normalization can still collapse two
+genuinely distinct products onto the same key (confirmed live:
+"Diclofenac Potassium" vs. "Diclofenac Sodium", "Levalbuterol HCl" vs.
+"Levalbuterol Tartrate") — so it only auto-accepts when exactly one
+catalog name matches, and reports the specific candidates instead of
+guessing when there's more than one. Deliberately does NOT add
+true edit-distance/typo fuzzy matching on top of this — real drug names
+are frequently one or two characters apart from a *different* real drug
+(the same reasoning that kept amazon_scraper.py's drug-name matching
+exact rather than fuzzy).
+
+Separately, confirmed live in a real browser: `url` points to the right
+drug page but the wrong quantity on load — e.g. requesting 90-count
+returns a URL that always displays 30-count pricing when opened. Root
+cause confirmed on Cost Plus Drugs' own site: its product page has no
+URL that encodes a specific quantity at all — clicking its own "90
+Count" button updates the on-page price (to the same $ figure this API's
+`quantity_units=90` returns) but never changes the URL, query string, or
+hash. So `url` here is already the single most specific link that exists
+for a given drug+strength+form — there's no more-specific one to switch
+to. `get_prices()` now appends a caveat to `price_label` whenever the
+requested quantity isn't the page's own default (confirmed live, always
+30) so the mismatch is surfaced instead of left silently misleading.
+
+The shipping fee itself is now surfaced too, when known: see
+costplusdrugs_shipping.py for how it's kept as a small, separately
+and periodically refreshed local file (its own module docstring explains
+why this couldn't just be one more field this API returns — the fee
+lives behind a real browser-only Cloudflare challenge). `get_prices()`
+reads that cache via `load_shipping_fee()` — a plain file read, no
+Selenium — and states the last-known fee and how long ago it was
+checked directly in `price_label`, rather than leaving the caveat as a
+vague "not returned by this API" with no number attached. A cache older
+than STALE_SHIPPING_FEE_DAYS gets an explicit staleness warning instead
+of being presented as current.
 """
 
 from __future__ import annotations
 
 import re
-import time
+from datetime import datetime, timezone
 
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+import requests
 
 from config import Config
 from costplusdrugs_formulary import find_entry, load_formulary
-from driver_utils import SeleniumScraperBase, robust_click
+from costplusdrugs_shipping import load_shipping_fee
 from models import PriceResult
 from utils import extract_price_from_text, token_matches
 
 SOURCE_NAME = "Cost Plus Drugs"
 
-# Confirmed live: the real search flow. A fake-looking "search bar" on the
-# homepage is actually a plain button (data-testid confirmed) that opens
-# a dialog containing the real input. Typing a drug name renders a
-# "Medication Results" section with real <a href="/medications/{slug}/">
-# links inside that dialog.
-SEARCH_HOME_URL = "https://www.costplusdrugs.com"
-SEARCH_TRIGGER_SELECTOR = '[data-testid="medications-search-trigger-button"]'
-SEARCH_DIALOG_SELECTOR = "#search-overlay-dialog"
-SEARCH_INPUT_SELECTOR = f"{SEARCH_DIALOG_SELECTOR} #search"
+API_BASE_URL = "https://us-central1-costplusdrugs-publicapi.cloudfunctions.net/main"
 
-# Reported live: search resolution failed for *every* drug, always — not a
-# wrong-drug pick, a total failure. Root cause, confirmed from a debug
-# dump of the exact run: an earlier version distinguished a real result
-# link from the bare "/medications/" link (e.g. "View All Health
-# Conditions") by counting path segments, assuming
-# `element.get_attribute("href")` returns a fully-resolved absolute URL
-# (which would have 5 segments after splitting on "/" — scheme, empty,
-# host, "medications", slug). It doesn't, at least not reliably here — it
-# returned the raw relative attribute (3 segments: empty, "medications",
-# slug), so *every* real result link failed that segment-count check on
-# *every* run, not just some. Separately, and confirmed from the same
-# dump: the homepage also has an unrelated "popular products" pill list
-# elsewhere on the page (`data-testid="products-pill-{slug}"`) whose links
-# match the exact same `/medications/{slug}/` shape as a real search
-# result — a plain shape-based match without also excluding these would
-# risk clicking an unrelated drug instead of what was actually searched
-# for. `_is_real_drug_link()` fixes both: matches by regex on whatever
-# form the href actually is (relative or absolute, side-stepping the
-# get_attribute ambiguity above) rather than counting segments, and
-# explicitly excludes both the bare "/medications/" link and the
-# "products-pill-*" pattern. The element search itself is also now scoped
-# to `#search-overlay-dialog` specifically, rather than the whole page,
-# so it can't match that unrelated pill list — or anything else outside
-# the dialog — in the first place.
-DRUG_LINK_PATTERN = re.compile(r"/medications/[a-z0-9][a-z0-9_-]*/?$", re.IGNORECASE)
+# Confirmed live: Cost Plus Drugs' shipping fee has been unchanged ($5.25)
+# across every check made during this project's history so far, across
+# different drugs and quantities — a flat, rarely-changing fee, not
+# something that needs re-checking constantly. This is a "the caller
+# should know this might be out of date" threshold, not a hard cutoff:
+# crossing it downgrades the price_label caveat's wording, it never
+# blocks or invalidates the result.
+STALE_SHIPPING_FEE_DAYS = 180
+
+# Deliberately only true salt/counterion words — never release-timing
+# modifiers ("ER"/"XR"/"XL"/"SR"/"CR"/"DR"/"extended release"/"delayed
+# release"). Confirmed live against the full catalog (see
+# _get_full_catalog()) that those mark genuinely different products —
+# e.g. "Metoprolol Tartrate" (immediate-release) vs. "Metoprolol
+# Extended Release (ER)" are not interchangeable, so stripping them
+# could silently collapse two different real drugs into the same
+# lookup. Pure salt words are safer but still not risk-free — see
+# _salt_stripped_lookup()'s ambiguous-match handling.
+_SALT_WORDS = {
+    "calcium", "sodium", "potassium", "magnesium", "hcl", "hydrochloride",
+    "succinate", "tartrate", "maleate", "besylate", "mesylate", "fumarate",
+    "citrate", "sulfate", "sulphate", "phosphate", "acetate", "bitartrate",
+    "dihydrate", "monohydrate", "trihydrate", "oxalate", "gluconate",
+    "chloride", "bromide", "iodide", "carbonate", "nitrate", "stearate",
+}
+
+_FULL_CATALOG_CACHE: list[dict] | None = None
 
 
-def _is_real_drug_link(el) -> bool:
-    href = el.get_attribute("href") or ""
-    path = href.split("?")[0]
-    idx = path.find("/medications/")
-    if idx == -1:
-        return False
-    path = path[idx:]
-    if path.rstrip("/") == "/medications" or "/categories/" in path:
-        return False
-    if (el.get_attribute("data-testid") or "").startswith("products-pill-"):
-        return False
-    return bool(DRUG_LINK_PATTERN.search(path))
-
-# Confirmed live: plain buttons, not a dropdown — e.g.
-# <button data-testid="strength-selection-20mg" aria-label="Select
-# Strength: 20mg">20mg</button>. Matched by visible text (via
-# _find_and_click_variant_button()) rather than constructing the
-# data-testid value directly, since this project's dosage/quantity
-# strings aren't guaranteed to exactly match Cost Plus Drugs' own token
-# formatting (e.g. "2.5mg").
-STRENGTH_BUTTON_PREFIX = "strength-selection-"
-QUANTITY_BUTTON_PREFIX = "quantity-selection-"
-
-# Confirmed live: the price calculator panel has a third selector above
-# strength/quantity — "Select Form" — for a plain
-# <button data-testid="form-selection-{Value}"> (e.g. "form-selection-
-# Tablet"), the same shape as strength/quantity. "Select Form"/"Select
-# Strength"/"Select Quantity" are themselves just section-heading text,
-# not clickable triggers — confirmed live by checking their tag/testid:
-# plain <div>s, not buttons.
-FORM_BUTTON_PREFIX = "form-selection-"
-
-# Tried in order; first one that yields a parseable price wins. Cost Plus
-# Drugs' front-end is a React app that may render prices under varying
-# class names — keep this list easy to extend once real markup is observed.
-PRICE_SELECTORS = [
-    "[data-testid*=price]",
-    ".price",
-    "[class*=Price]",
-    "[class*=price]",
-]
-
-# Confirmed live: the page states its price assumption in plain sentence
-# form — "A 30 count supply of 20mg Lisinopril will cost: ... $5.55" —
-# right above the price. That's the pack size the displayed price is
-# actually for; nothing about the URL/slug alone reveals it, and it
-# varies per drug (not assumed to always be 30).
-QUANTITY_ASSUMPTION_PATTERN = re.compile(r"a\s+(\d+)\s+count supply", re.IGNORECASE)
+def _normalize_for_salt_match(name: str) -> str:
+    """Lowercase, drop punctuation/separators, strip pure salt words —
+    but never strip *every* word: some drugs' whole name is a salt
+    (e.g. "Potassium Chloride", "Calcium Acetate" are themselves the
+    active ingredient, not a salt-of-something-else), so stripping
+    everything there would incorrectly treat two unrelated drugs as
+    the same lookup key."""
+    words = [w for w in re.split(r"[\s/-]+", name.lower()) if w]
+    kept = [w for w in words if w not in _SALT_WORDS] or words
+    return "".join(re.sub(r"[^a-z0-9]", "", w) for w in kept)
 
 
-def _extract_quantity_assumption(text: str) -> str:
-    match = QUANTITY_ASSUMPTION_PATTERN.search(text)
-    return f"{match.group(1)} count" if match else ""
+def _get_full_catalog() -> list[dict]:
+    """Confirmed live: calling the API with no filter params at all
+    returns its *entire* catalog (2,373 rows / 872 unique
+    medication_name values as of this check, ~1.2MB) rather than an
+    error or nothing — that's what makes client-side salt-normalized
+    matching possible below. Cached for the life of the process: this
+    catalog doesn't change minute-to-minute, and re-fetching ~1.2MB on
+    every fallback lookup would be wasteful."""
+    global _FULL_CATALOG_CACHE
+    if _FULL_CATALOG_CACHE is None:
+        _FULL_CATALOG_CACHE = _api_get({})
+    return _FULL_CATALOG_CACHE
 
 
-# Requested directly: surface the shipping cost the page itself discloses.
-# Confirmed live: the price breakdown section states it as its own line —
-# "Standard Shipping *Additional cost at checkout" followed by a dollar
-# amount ($5.25, confirmed unchanged across 30/60/90-count for the same
-# drug — a flat fee, not scaled by quantity, at least in what's been
-# observed) — separate from and *not* included in "Your Drug Price With
-# Us" above it (confirmed live: Manufacturing + Markup + Pharmacy Labor
-# alone already sum to that headline price). Bounded to 100 chars after
-# the label rather than an unbounded/greedy match, so this can't run past
-# an unrelated later $ amount if the page's wording ever shifts.
-SHIPPING_PATTERN = re.compile(r"Standard Shipping[^$]{0,100}\$\s*(\d+(?:\.\d{2})?)", re.IGNORECASE)
+def _salt_stripped_lookup(drug_name: str) -> tuple[list[dict], str | None, list[str]]:
+    """Last-resort lookup after exact medication_name and brand_name
+    both miss (e.g. "Atorvastatin Calcium" when the catalog only has
+    "Atorvastatin"). Matches the salt-normalized query against every
+    catalog medication_name/brand_name, but only *auto-accepts* when
+    exactly one distinct real catalog name maps to that normalized key.
 
+    Confirmed live this matters: normalizing away salt words alone
+    still collapses some genuinely different, clinically distinct
+    catalog entries onto the same key — e.g. "Diclofenac Potassium"
+    (immediate-release) vs. "Diclofenac Sodium" (enteric-coated), or
+    "Levalbuterol HCl" vs. "Levalbuterol Tartrate". Silently picking
+    one would repeat the exact mistake this project's own
+    identity/dosage/formulation filters elsewhere are built to avoid
+    (showing the wrong drug is worse than showing nothing) — so this
+    returns those as `ambiguous_candidates` instead of guessing, and
+    the caller reports them for the user to disambiguate by retyping
+    the exact one they meant.
 
-def _extract_shipping_cost(text: str) -> float | None:
-    match = SHIPPING_PATTERN.search(text)
-    return float(match.group(1)) if match else None
-
-
-def _find_and_click_variant_button(driver, prefix: str, target_text: str, timeout: float | None = None) -> bool:
-    """Confirmed live: Cost Plus Drugs' strength/quantity selectors are
-    plain `<button data-testid="{prefix}{value}">` elements (e.g.
-    "strength-selection-20mg", "quantity-selection-90"), not a dropdown —
-    clicking one live-updates the displayed price (and, for strength,
-    the URL) with no reload needed. Matched by visible button text
-    using the same loose substring-normalize check used elsewhere in
-    this project, rather than constructing the data-testid value
-    directly — safer against a token format mismatch (e.g. "2.5mg").
-
-    Reported live: a real, visible, correctly-labeled strength button
-    (e.g. "strength-selection-40mg", confirmed present and matching by
-    live DOM inspection) was still reported as "no matching strength
-    button found" — and separately, quantity selection silently failed
-    the same way. Root cause, confirmed by reproducing the exact flow
-    directly: the Silktide cookie-consent backdrop div responsible for
-    the "element click intercepted" bug already fixed for the search
-    result link (see the resolve_and_select() writeup) isn't scoped to
-    the search dialog at all — it's a site-wide overlay that persists
-    across the client-side route change onto the drug page itself, and
-    was still present and still intercepting clicks here. This
-    function's `b.click()` is a native click, and the backdrop
-    intercepted it every single time — silently, since the broad
-    `except Exception: pass` here swallowed that error the same way it
-    would swallow a real "not found," so it just polled until timeout
-    and reported a false negative for a button that was genuinely
-    present, correctly matched, and simply never successfully clicked.
-    Fixed by applying the same native-click-then-JS-fallback pattern
-    already used for the search result link: only decide "not found"
-    once a poll (for up to `timeout` seconds, defaulting to
-    Config.SELENIUM_WAIT_TIMEOUT — this part of the earlier fix, for the
-    genuine "button row hasn't rendered yet" race, is still needed and
-    correct on its own) truly finds no matching button at all, not
-    whenever clicking one happens to fail.
-
-    Reviewed live: the "loose substring-normalize check" this docstring
-    used to describe was a plain bidirectional substring test — unanchored,
-    so requesting "5mg" against a page whose only strength button was
-    "25mg" would match and click that wrong button, with nothing here or
-    in any caller ever re-reading the page afterward to confirm which
-    strength actually got selected. Fixed by matching through
-    utils.token_matches() instead, which requires the two sides' leading
-    numbers to be numerically equal (not just one containing the other)
-    while still tolerating a differing trailing unit word ("mg" vs
-    nothing, "count" vs "tablets") and still substring-matching
-    non-numeric values like a form name — see that function's own
-    docstring for the full reasoning, shared with the identical fix in
-    goodrx_scraper.py's/singlecare_scraper.py's _loose_matches()."""
-    if timeout is None:
-        timeout = Config.SELENIUM_WAIT_TIMEOUT
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            buttons = driver.find_elements(By.CSS_SELECTOR, f'[data-testid^="{prefix}"]')
-            for b in buttons:
-                if token_matches(target_text, b.text or ""):
-                    robust_click(driver, b)
-                    return True
-        except Exception:
-            pass
-        time.sleep(0.3)
-    return False
-
-
-def _wait_for_stable_price(driver, timeout: float) -> str | None:
-    """Wait for a $ amount to appear in the rendered page — AND still be
-    there ~1s later, not just momentarily. Returns the confirmed-stable body
-    text (so the caller extracts from the exact text that was verified,
-    rather than re-querying and risking yet another race), or None if
-    nothing ever stabilized within the timeout.
-
-    This is a client-rendered Next.js page with no data-testid/class hook to
-    wait on (it uses plain Tailwind utility classes), so this polls the
-    first-dollar-amount text pattern itself rather than a selector. The
-    "still there a beat later" re-check is deliberate: confirmed live, the
-    price can flash into the DOM and then disappear again a moment
-    later — consistent with the site's bot-scoring intermittently killing
-    an in-flight retry of its own price-data fetch mid-render.
+    Returns (rows, resolved_name, ambiguous_candidates): `rows` is
+    populated only alongside a non-None `resolved_name` (the single
+    safe match); `ambiguous_candidates` lists 2+ real catalog names
+    when the key wasn't unique.
     """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        text = driver.find_element(By.TAG_NAME, "body").text
-        if extract_price_from_text(text) is not None:
-            time.sleep(1)
-            text_again = driver.find_element(By.TAG_NAME, "body").text
-            if extract_price_from_text(text_again) is not None:
-                return text_again
-            # It flashed and vanished — keep polling rather than giving up.
-        time.sleep(0.5)
-    return None
+    target = _normalize_for_salt_match(drug_name)
+    if not target:
+        return [], None, []
+
+    catalog = _get_full_catalog()
+    matching_names: dict[str, str] = {}  # catalog name -> field it matched on
+    for row in catalog:
+        for field in ("medication_name", "brand_name"):
+            value = row.get(field, "")
+            if value and value not in matching_names and _normalize_for_salt_match(value) == target:
+                matching_names[value] = field
+
+    candidates = sorted(matching_names)
+    if len(candidates) != 1:
+        return [], None, candidates
+
+    resolved_name = candidates[0]
+    field_used = matching_names[resolved_name]
+    rows = [r for r in catalog if r.get(field_used) == resolved_name]
+    return rows, resolved_name, []
 
 
-class _CostPlusDrugsSeleniumFallback(SeleniumScraperBase):
-    def resolve_and_select(
-        self, drug_name: str, formulation: str, dosage: str, quantity: str | None
-    ) -> tuple[str, str, str]:
-        """Returns (resolved_url, selection_caveat, error). See module
-        docstring for the search flow and why it replaces slug-guessing.
-        selection_caveat is separate from error: not finding a matching
-        form/strength button isn't a total failure — the page still has
-        *some* price on it (the search result's default form/dosage) —
-        but silently returning that as if it were the requested one would
-        repeat the same "silently wrong data" mistake already fixed
-        elsewhere in this project, so it's flagged instead. Quantity gets
-        no such caveat — see the quantity block below for why."""
-        try:
-            self.driver.get(SEARCH_HOME_URL)
-        except Exception as e:
-            return "", "", f"navigation to Cost Plus Drugs homepage failed: {e}"
+def _shipping_fee_caveat() -> str:
+    """Builds the shipping half of every price_label. Reads
+    costplusdrugs_shipping.py's cached fee (a plain file read — never
+    touches a browser itself) and states the concrete last-known number
+    and how long ago it was checked, rather than the old vague "not
+    returned by this API" with no figure attached. Falls back to that
+    vague wording, plus a pointer to the updater, only when no cache
+    file exists yet."""
+    record = load_shipping_fee()
+    if record is None:
+        return (
+            "excludes Cost Plus Drugs' flat standard shipping fee, charged "
+            "separately at checkout and not returned by this API (run "
+            "costplusdrugs_shipping.py to cache the current fee)"
+        )
 
-        try:
-            trigger = WebDriverWait(self.driver, Config.SELENIUM_WAIT_TIMEOUT).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, SEARCH_TRIGGER_SELECTOR))
-            )
-            # Reported live: "element click intercepted ... Other element
-            # would receive the click: <div id='silktide-backdrop' ...>"
-            # — the exact same cookie-consent overlay already confirmed
-            # and fixed for the strength/quantity/form buttons and the
-            # search-result-link click elsewhere in this file, just at
-            # this click site (the very first one, opening the search
-            # dialog) instead — that fallback was never applied here.
-            # Same fix: fall back to a JS-dispatched click, which invokes
-            # the button's own click handler directly regardless of
-            # what's visually drawn on top of it.
-            robust_click(self.driver, trigger)
-            search_input = WebDriverWait(self.driver, Config.SELENIUM_WAIT_TIMEOUT).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, SEARCH_INPUT_SELECTOR))
-            )
-            search_input.send_keys(drug_name)
-        except Exception as e:
-            return "", "", f"could not open/type into Cost Plus Drugs' search: {e}"
+    try:
+        checked_at = datetime.fromisoformat(record.checked_at)
+        age_days = (datetime.now(timezone.utc) - checked_at).days
+    except ValueError:
+        age_days = None
 
-        # Reported live (twice): search resolution failed for '{drug_name}'
-        # despite the debug snapshot taken right after the failure showing
-        # the correct result links present in the DOM all along. Root
-        # cause, confirmed by replaying the exact snapshot's markup
-        # through _is_real_drug_link()/DRUG_LINK_PATTERN above: the
-        # matching logic itself is fine. The bug was in how it was waited
-        # for — WebDriverWait(...).until(lambda d: ...) iterates live
-        # elements and calls .get_attribute() on each, but Selenium's
-        # WebDriverWait only auto-ignores NoSuchElementException by
-        # default, not StaleElementReferenceException. This dialog
-        # re-renders its suggestion list on every keystroke (typed via
-        # send_keys, i.e. character by character), so it's easy for an
-        # element handed out by one find_elements() call to go stale
-        # before _is_real_drug_link() finishes reading its attributes —
-        # when that happened, the exception propagated straight out of
-        # .until() and killed the wait immediately, well before its real
-        # timeout and well before the DOM had actually settled. Replaced
-        # with an explicit poll loop (same "read twice, must match"
-        # stability pattern used in goodrx_scraper.py/
-        # singlecare_scraper.py's suggestion-click fixes) that catches
-        # per-iteration exceptions instead of letting them abort the wait,
-        # and only clicks once the set of matching hrefs reads the same
-        # on two consecutive passes — guarding against clicking a
-        # suggestion that only reflects a not-yet-finished keystroke too.
-        link = None
-        deadline = time.monotonic() + Config.SELENIUM_WAIT_TIMEOUT
-        last_hrefs = None
-        while time.monotonic() < deadline:
-            try:
-                candidates = [
-                    a for a in self.driver.find_elements(
-                        By.CSS_SELECTOR, f'{SEARCH_DIALOG_SELECTOR} a[href*="/medications/"]'
-                    )
-                    if _is_real_drug_link(a)
-                ]
-                hrefs = tuple(a.get_attribute("href") for a in candidates)
-            except Exception:
-                # Likely a stale element mid-re-render — the DOM is still
-                # changing, so treat this as "not settled yet" and retry
-                # rather than giving up.
-                time.sleep(0.3)
-                continue
-            if hrefs and hrefs == last_hrefs:
-                link = candidates[0]
-                break
-            last_hrefs = hrefs
-            time.sleep(0.3)
+    caveat = (
+        f"excludes Cost Plus Drugs' flat standard shipping fee "
+        f"(${record.fee:.2f} as of last check"
+    )
+    if age_days is not None:
+        caveat += f", {age_days} day{'s' if age_days != 1 else ''} ago"
+    caveat += "; not returned by this API), charged separately at checkout"
+    if age_days is not None and age_days > STALE_SHIPPING_FEE_DAYS:
+        caveat += (
+            f" — ⚠ that check is over {STALE_SHIPPING_FEE_DAYS} days old, "
+            "the fee may have changed since; run costplusdrugs_shipping.py "
+            "to refresh it"
+        )
+    return caveat
 
-        if link is None:
-            self._save_debug_page("page_costplusdrugs_no_search_results.html")
-            return "", "", (
-                f"no search results appeared for '{drug_name}' — see "
-                "page_costplusdrugs_no_search_results.html"
-            )
 
-        # Reported live again: even after the stability check above passed,
-        # link.click() itself could still raise (StaleElementReferenceException
-        # if one more re-render slipped in between the check and the click —
-        # a narrow but real window). The first fix for this re-found the
-        # element via a CSS selector built from the href string captured
-        # during the stability check — but that's exactly the same
-        # get_attribute("href") relative-vs-absolute ambiguity documented
-        # above, biting a different piece of code: confirmed live, that
-        # selector attribute value is matched against the *literal* HTML
-        # attribute, while get_attribute("href") had returned the
-        # browser-resolved absolute form here — so the selector could never
-        # match anything, "no such element" every time, regardless of
-        # whether the link was actually there. Fixed by not trying to
-        # relocate the element by its href string at all: just re-run the
-        # same find-and-filter query fresh and click immediately, a few
-        # times, since a fresh query always returns live (non-stale)
-        # elements as of that instant.
-        # Reported live yet again, this time with the actual error attached:
-        # "element click intercepted ... Other element would receive the
-        # click: <div id="silktide-backdrop" ...>". A genuinely different
-        # bug from the two stale-element races above — a cookie-consent
-        # widget's (Silktide) backdrop div was sitting on top of the whole
-        # page. Selenium's native .click() refuses to click anything that
-        # isn't the actual topmost element at that pixel, so plain retries
-        # of the same native click would fail identically every time the
-        # backdrop is present, no matter how many attempts. Rather than
-        # deciding cookie-consent semantics (accept/decline) to dismiss it,
-        # this instead dispatches the click via JS
-        # (`execute_script("arguments[0].click()", ...)`), which invokes
-        # the element's own click handler directly and is unaffected by
-        # whatever else is visually drawn on top of it — this project
-        # never needs to interact with that widget at all, just get past
-        # it. Tried after a plain click fails rather than unconditionally,
-        # since a native click is the more faithful simulation of a real
-        # user when nothing is actually blocking it.
-        clicked = False
-        last_error = None
-        for _ in range(3):
-            try:
-                fresh = [
-                    a for a in self.driver.find_elements(
-                        By.CSS_SELECTOR, f'{SEARCH_DIALOG_SELECTOR} a[href*="/medications/"]'
-                    )
-                    if _is_real_drug_link(a)
-                ]
-                if not fresh:
-                    time.sleep(0.3)
-                    continue
-                target = fresh[0]
-                robust_click(self.driver, target)
-                clicked = True
-                break
-            except Exception as e:
-                last_error = e
-                time.sleep(0.3)
+# Cost Plus Drugs' own page used to state its default pack size in plain
+# sentence form ("A 30 count supply of ... will cost:"), varying per
+# drug — that's what the old scraper reported when no --quantity was
+# given. The API has no equivalent "what's this drug's own default pack
+# size" field; it only quotes whatever quantity_units you actually ask
+# for. Rather than guess at a per-drug default this project has no way
+# to ask for, this falls back to a fixed, clearly-labeled assumption
+# instead of silently presenting it as Cost Plus Drugs' own default.
+DEFAULT_QUANTITY_UNITS = "30"
 
-        if not clicked:
-            self._save_debug_page("page_costplusdrugs_no_search_results.html")
-            return "", "", f"found a search result for '{drug_name}' but could not click it: {last_error}"
 
-        try:
-            WebDriverWait(self.driver, Config.SELENIUM_WAIT_TIMEOUT).until(
-                lambda d: "/medications/" in d.current_url
-                and d.current_url.rstrip("/") != f"{SEARCH_HOME_URL}/medications"
-            )
-        except Exception:
-            pass
+def _error_result(drug_name: str, formulation: str, dosage: str, error: str, url: str = "") -> list[PriceResult]:
+    return [
+        PriceResult(
+            drug_name=drug_name, formulation=formulation, dosage=dosage,
+            source=SOURCE_NAME, url=url, error=error,
+        )
+    ]
 
-        # Confirmed live: the search result lands on the drug's *default*
-        # form/dosage page regardless of what was searched for — these
-        # on-page buttons are what actually reach the requested ones.
-        # Form is selected first, matching the page's own top-to-bottom
-        # order ("Select Form" above "Select Strength" above "Select
-        # Quantity") — unconfirmed whether choosing form after strength
-        # would ever matter (e.g. resetting strength), but there's no
-        # reason to risk it when matching the page's own order is free.
-        caveats = []
-        if formulation:
-            if _find_and_click_variant_button(self.driver, FORM_BUTTON_PREFIX, formulation):
-                time.sleep(1)  # let the client-side route/price update settle
-            else:
-                caveats.append(f"could not select form {formulation} (no matching form button found)")
 
-        if dosage:
-            if _find_and_click_variant_button(self.driver, STRENGTH_BUTTON_PREFIX, dosage):
-                time.sleep(1)
-            else:
-                caveats.append(f"could not select dosage {dosage} (no matching strength button found)")
-
-        if quantity:
-            if _find_and_click_variant_button(self.driver, QUANTITY_BUTTON_PREFIX, quantity):
-                time.sleep(1)
-
-        resolved = self.driver.current_url.split("?")[0].rstrip("/")
-        return resolved, "; ".join(caveats), ""
-
-    def extract_price(self) -> tuple[float | None, str, str, float | None]:
-        stable_text = _wait_for_stable_price(self.driver, Config.SELENIUM_WAIT_TIMEOUT)
-        if stable_text is None:
-            self._save_debug_page("page_costplusdrugs_no_price.html")
-            return None, "", "", None
-
-        # Extract from the confirmed-stable live text directly, not
-        # page_source — confirmed live that driver.page_source can lag
-        # behind what .text already reliably shows for this page's
-        # client-rendered price (a separate issue from the flash above:
-        # this is page_source itself trailing the live DOM, not the price
-        # disappearing). No selector-based extraction is possible here
-        # either way — this page has no data-testid/class hook on the price.
-        price = extract_price_from_text(stable_text)
-        match = re.search(r".{0,30}\$\s?\d{1,4}(?:\.\d{2})?.{0,10}", stable_text)
-        raw = match.group(0) if match else ""
-        quantity = _extract_quantity_assumption(stable_text)
-        shipping_cost = _extract_shipping_cost(stable_text)
-        return price, raw, quantity, shipping_cost
+def _api_get(params: dict) -> list[dict]:
+    """Raises on network/HTTP failure — every caller catches broadly,
+    matching every other scraper's "never raise past get_prices()"
+    contract."""
+    # Config.REQUEST_TIMEOUT_SECONDS was kept validated (unused) after
+    # SingleCare/Cost Plus Drugs' original plain-fetch paths were both
+    # replaced by Selenium, for exactly this situation: "in case a plain-
+    # fetch path is reintroduced later." It has been now.
+    response = requests.get(API_BASE_URL, params=params, timeout=Config.REQUEST_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    return response.json().get("results", [])
 
 
 def get_prices(
     drug_name: str,
     formulation: str,
     dosage: str,
+    # Accepted for signature parity with the other three sites'
+    # get_prices() — never used here, same as before this switch: Cost
+    # Plus Drugs is a single flat-price mail-order pharmacy with no
+    # ZIP-based price variation to look up.
     zip_code: str | None = None,
     quantity: str | None = None,
 ) -> list[PriceResult]:
     """Never raises — any unexpected failure is returned as an error PriceResult
     so main.py can treat every site the same way."""
-    url = ""
     try:
         if Config.COSTPLUSDRUGS_LOOKUP_MODE == "file":
             try:
                 entries = load_formulary(Config.COSTPLUSDRUGS_FORMULARY_PATH)
             except FileNotFoundError:
-                return [
-                    PriceResult(
-                        drug_name=drug_name,
-                        formulation=formulation,
-                        dosage=dosage,
-                        source=SOURCE_NAME,
-                        error=(
-                            f"COSTPLUSDRUGS_LOOKUP_MODE=file but formulary file not found: "
-                            f"{Config.COSTPLUSDRUGS_FORMULARY_PATH}"
-                        ),
-                    )
-                ]
+                return _error_result(
+                    drug_name, formulation, dosage,
+                    "COSTPLUSDRUGS_LOOKUP_MODE=file but formulary file not found: "
+                    f"{Config.COSTPLUSDRUGS_FORMULARY_PATH}",
+                )
             if find_entry(entries, drug_name, dosage, formulation) is None:
-                return [
-                    PriceResult(
-                        drug_name=drug_name,
-                        formulation=formulation,
-                        dosage=dosage,
-                        source=SOURCE_NAME,
-                        error=(
-                            "not found in Team Cuban Card formulary list — "
-                            "not carried by Cost Plus Drugs (skipped live lookup)"
-                        ),
-                    )
-                ]
+                return _error_result(
+                    drug_name, formulation, dosage,
+                    "not found in Team Cuban Card formulary list — "
+                    "not carried by Cost Plus Drugs (skipped live lookup)",
+                )
             # Found in the formulary — it has no price column, so the live
-            # site is still needed for the actual $ number. Fall through.
+            # API is still needed for the actual $ number. Fall through.
 
         try:
-            with _CostPlusDrugsSeleniumFallback(headless=Config.HEADLESS_DEFAULT) as scraper:
-                resolved_url, selection_caveat, resolve_error = scraper.resolve_and_select(
-                    drug_name, formulation, dosage, quantity
-                )
-                if not resolved_url:
-                    return [
-                        PriceResult(
-                            drug_name=drug_name, formulation=formulation, dosage=dosage,
-                            source=SOURCE_NAME,
-                            error=resolve_error or f"could not resolve a Cost Plus Drugs page for '{drug_name}'",
-                        )
-                    ]
-                url = resolved_url
-                price, raw, quantity_shown, shipping_cost = scraper.extract_price()
+            rows = _api_get({"medication_name": drug_name})
         except Exception as e:
-            return [
-                PriceResult(
-                    drug_name=drug_name, formulation=formulation, dosage=dosage,
-                    source=SOURCE_NAME, url=url, error=f"Selenium failed: {e}",
-                )
-            ]
+            return _error_result(drug_name, formulation, dosage, f"Cost Plus Drugs API request failed: {e}")
 
+        if not rows:
+            # Confirmed live: this API does exact-string matching only, no
+            # fuzzy/substring/typo tolerance, and medication_name/brand_name
+            # are two disjoint fields — "Lipitor" has zero medication_name
+            # rows but four brand_name rows (the reverse of "Atorvastatin").
+            # A drug typed by its brand name would otherwise report a false
+            # "not carried" even though Cost Plus Drugs stocks it. Retry
+            # against brand_name before giving up.
+            try:
+                rows = _api_get({"brand_name": drug_name})
+            except Exception as e:
+                return _error_result(drug_name, formulation, dosage, f"Cost Plus Drugs API request failed: {e}")
+
+        resolved_via_salt_strip: str | None = None
+        if not rows:
+            try:
+                rows, resolved_via_salt_strip, ambiguous = _salt_stripped_lookup(drug_name)
+            except Exception as e:
+                return _error_result(drug_name, formulation, dosage, f"Cost Plus Drugs API request failed: {e}")
+            if ambiguous:
+                return _error_result(
+                    drug_name, formulation, dosage,
+                    f"'{drug_name}' matches more than one distinct Cost Plus Drugs catalog "
+                    f"entry once salt names are normalized away — refusing to guess which one "
+                    f"you meant: {', '.join(ambiguous)}. Retype the exact one you want.",
+                )
+
+        if not rows:
+            return _error_result(
+                drug_name, formulation, dosage,
+                f"no Cost Plus Drugs catalog entry for '{drug_name}' (checked generic name, "
+                "brand name, and a salt-normalized match against the full catalog — the API "
+                "itself requires an exact match, no fuzzy/typo tolerance)",
+            )
+
+        # Form first, then strength — same priority order the old
+        # Selenium flow used (the page's own top-to-bottom "Select Form"
+        # above "Select Strength"), applied here as filters instead of
+        # button clicks. Hard-excludes on mismatch rather than falling
+        # back to "everything", matching every other site's drug-
+        # identity/formulation/dosage filters in this project: showing a
+        # wrong strength or form is worse than showing nothing.
+        form_matching = [r for r in rows if token_matches(formulation, r.get("form", ""))] if formulation else rows
+        if formulation and not form_matching:
+            available = ", ".join(sorted({r.get("form", "") for r in rows if r.get("form")})) or "none listed"
+            return _error_result(
+                drug_name, formulation, dosage,
+                f"no result for formulation '{formulation}' — available: {available}",
+            )
+
+        dosage_matching = (
+            [r for r in form_matching if token_matches(dosage, r.get("strength", ""))]
+            if dosage else form_matching
+        )
+        if dosage and not dosage_matching:
+            available = (
+                ", ".join(sorted({r.get("strength", "") for r in form_matching if r.get("strength")}))
+                or "none listed"
+            )
+            return _error_result(
+                drug_name, formulation, dosage,
+                f"no result for dosage '{dosage}' — available: {available}",
+            )
+
+        row = dosage_matching[0]
+        ndc = row.get("ndc", "")
+        url = row.get("url", "")
+
+        quantity_units = quantity or DEFAULT_QUANTITY_UNITS
+        # "count" suffix matches this project's established quantity-string
+        # convention (main.py's QUANTITY_COUNT_PATTERN parses it back out
+        # to decide whether normalize_quantities() needs to rescale a
+        # result at all) — a bare number would still behave correctly
+        # there (it just fails to parse, which normalize_quantities()
+        # already treats as "leave it alone"), but this makes the actual
+        # requested quantity legible in the CLI/GUI output the same way
+        # every other site's quantity column already is.
+        quantity_label = (
+            f"{quantity_units} count" if quantity
+            else f"{quantity_units} count (assumed default quantity, not requested)"
+        )
+
+        try:
+            quote_rows = _api_get({"ndc": ndc, "quantity_units": quantity_units})
+        except Exception as e:
+            return _error_result(drug_name, formulation, dosage, f"Cost Plus Drugs API request failed: {e}", url)
+
+        if not quote_rows:
+            return _error_result(
+                drug_name, formulation, dosage,
+                f"Cost Plus Drugs' API returned no quote for NDC {ndc} at quantity {quantity_units}",
+                url,
+            )
+
+        price = extract_price_from_text(quote_rows[0].get("requested_quote", ""))
         if price is None:
-            return [
-                PriceResult(
-                    drug_name=drug_name,
-                    formulation=formulation,
-                    dosage=dosage,
-                    source=SOURCE_NAME,
-                    url=url,
-                    error="no price found",
-                )
-            ]
+            return _error_result(drug_name, formulation, dosage, "no price returned by Cost Plus Drugs' API", url)
 
-        label = "cash price (no insurance)"
-        # Requested directly: fold the page's own disclosed shipping fee
-        # into `price` rather than tracking it as a separate field, with
-        # a note so the total isn't silently different from what the
-        # page's own headline "Your Drug Price With Us" number shows —
-        # confirmed live that fee is stated separately there (see
-        # _extract_shipping_cost()'s docstring), not already included.
-        if shipping_cost is not None:
-            price = round(price + shipping_cost, 2)
-            label += f" — includes ${shipping_cost:.2f} shipping"
-        if selection_caveat:
-            label += f" — prices may be inaccurate: {selection_caveat}"
+        label = f"cash price (no insurance) — {_shipping_fee_caveat()}"
+        if quantity_units != DEFAULT_QUANTITY_UNITS:
+            # Confirmed live in the browser: Cost Plus Drugs' own product
+            # page has no URL that encodes a specific quantity at all —
+            # clicking its "90 Count" button updates the on-page price (to
+            # the same $ figure this API's quantity_units=90 returns) but
+            # never changes the URL, query string, or hash. So `url` here
+            # is already the most specific link that exists for this drug,
+            # but it will always land on the page's own default view
+            # (confirmed always 30, matching DEFAULT_QUANTITY_UNITS above)
+            # regardless of what quantity was actually requested/quoted —
+            # surfaced here rather than leaving the mismatch silent.
+            label += (
+                f"; note: the linked page defaults to showing "
+                f"{DEFAULT_QUANTITY_UNITS}-count pricing — there is no "
+                f"quantity-specific URL on Cost Plus Drugs' site, so "
+                f"you'll need to reselect '{quantity_units} Count' there "
+                "yourself to see this quote reflected on the page"
+            )
+        if resolved_via_salt_strip:
+            # Never substitute silently — same "wrong drug is worse than no
+            # drug" philosophy as the hard-exclude formulation/dosage
+            # filters above, just surfaced as a caveat instead of an error
+            # since this path only ever auto-accepts an unambiguous match.
+            label = (
+                f"interpreted '{drug_name}' as Cost Plus Drugs' catalog entry "
+                f"'{resolved_via_salt_strip}' (salt name normalized away); " + label
+            )
 
         return [
             PriceResult(
@@ -564,22 +461,13 @@ def get_prices(
                 source=SOURCE_NAME,
                 price=price,
                 price_label=label,
-                quantity=quantity_shown,
+                quantity=quantity_label,
                 url=url,
-                raw_text=raw,
+                raw_text=str(quote_rows[0]),
             )
         ]
     except Exception as e:
-        return [
-            PriceResult(
-                drug_name=drug_name,
-                formulation=formulation,
-                dosage=dosage,
-                source=SOURCE_NAME,
-                url=url,
-                error=f"unexpected error: {e}",
-            )
-        ]
+        return _error_result(drug_name, formulation, dosage, f"unexpected error: {e}")
 
 
 if __name__ == "__main__":

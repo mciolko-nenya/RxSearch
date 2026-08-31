@@ -304,6 +304,73 @@ Presentation only, same as before: the `/api/search` route calls
 reimplementing any of that logic, so the GUI and the CLI always behave
 identically.
 
+## API
+
+`gui.py` also serves a plain JSON API, separate from the browser page and
+the page's own internal `/api/search` (a POST-with-JSON-body endpoint
+that's this GUI's own implementation detail — its exact shape is free to
+change alongside the page, since nothing outside it depends on that
+contract). The API below is the stable, documented one meant for
+external callers — same underlying pipeline either way, since both just
+call `main.py`'s own functions.
+
+```bash
+python gui.py   # same server, same command, as before
+```
+
+**`GET /api/v1/prices`** — query parameters:
+
+| Param | Required | Meaning |
+|---|---|---|
+| `drug` | yes | Drug name, e.g. `lisinopril` |
+| `dosage` | yes | Dosage/strength, e.g. `20mg` |
+| `formulation` | no (default `tablet`) | e.g. `tablet`, `capsule`, `liquid` |
+| `quantity` | no | Requested pack size, e.g. `30` — same rescaling/exact-quote behavior as `--quantity` on the CLI (see [What quantity is this pricing for?](#what-quantity-is-this-pricing-for)) |
+| `zip` | no | ZIP code — ignored by Cost Plus Drugs, used by GoodRx/SingleCare |
+| `sites` | no (default: this deployment's `ENABLED_SITES`) | Comma-separated subset, e.g. `sites=costplusdrugs` or `sites=goodrx,amazon`. Validated against `ENABLED_SITES`, not the full four — a site this deployment has disabled (e.g. a Cost-Plus-Drugs-only Render deployment with no Chrome installed at all) is rejected here even if requested explicitly, not just hidden from the GUI's checkboxes |
+
+```bash
+curl "http://localhost:5057/api/v1/prices?drug=lisinopril&dosage=20mg&quantity=30&sites=costplusdrugs"
+```
+
+Returns `{"results": [...]}`, one entry per `PriceResult` (same fields
+the CLI's `--json` output and `/api/search` already use — `source`,
+`price`, `price_label`, `quantity`, `url`, `error`, etc.). A request-level
+problem (missing `drug`/`dosage`, an unknown/disabled site) is a `400`
+with an `{"error": ...}` body; a per-site failure (blocked, no match,
+bot check) is a normal `200` with that site's own `PriceResult.error`
+set instead — the same "never raise, report a failed row" contract every
+scraper's `get_prices()` already follows, extended to the API's own
+request-level validation too.
+
+**`GET /api/v1/sites`** — returns `{"sites": [...]}`, this deployment's
+actual `ENABLED_SITES`. Lets a caller discover what's queryable without
+hard-coding site names or guessing from a Render deployment's config.
+
+**CAPTCHAs are force-disabled for API calls, not just left to time out.**
+GoodRx and SingleCare can show an interactive CAPTCHA that the GUI's own
+`/api/search` handles by blocking the request and showing a human a
+browser modal to solve it in (see above) — an API caller has neither a
+modal nor a human watching. Left alone, a challenged site would just
+block an `/api/v1/prices` request for the full 30-minute challenge
+timeout before finally reporting failure. Instead, `_captcha_disabled_for_api()`
+temporarily forces `GOODRX_INTERACTIVE_CAPTCHA`/`SINGLECARE_INTERACTIVE_CAPTCHA`
+off for the duration of the request (restored afterward — these are
+shared `Config` class attributes, not per-request state, so a
+concurrent GUI search must get its real interactive behavior back
+unaffected) — a challenged site fails fast with a normal error result
+instead of hanging. Verified directly: the flags flip off inside the
+context manager and are restored afterward, including when the
+lookup itself raises.
+
+Only the three Selenium-based sites (`goodrx`/`singlecare`/`amazon`)
+take the same `_run_lock` the GUI's searches already use — it exists to
+stop two browser sessions launching at once, so a `sites=costplusdrugs`
+request skips it entirely and never queues behind an unrelated
+GoodRx/SingleCare/Amazon lookup. Verified live: `sites=costplusdrugs`
+returns immediately with a real price; `sites=notarealsite` and a
+request missing `drug`/`dosage` both return the expected `400`.
+
 ## Configuration
 
 All settings live in `.env` (see `.env.example`); nothing is hardcoded and
@@ -313,12 +380,12 @@ there are no stored Amazon credentials.
 |---|---|---|
 | `DEFAULT_ZIP_CODE` | *(empty)* | Used when `--zip` isn't passed; must be 5 digits if set |
 | `HEADLESS_DEFAULT` | `true` | Run Selenium browsers headless; `--debug` overrides this to `false` |
-| `REQUEST_TIMEOUT_SECONDS` | `15` | Currently unused — both sites this originally timed out (SingleCare, Cost Plus Drugs) have since moved to Selenium-only, with no plain HTTP fetch left in either. Kept validated in `config.py` in case a plain-fetch path is reintroduced later |
+| `REQUEST_TIMEOUT_SECONDS` | `15` | Timeout for `costplusdrugs_scraper.py`'s plain HTTP calls to Cost Plus Drugs' own public API (see [switched to their own public API](#cost-plus-drugs-switched-to-their-own-public-api) below). Was unused for a while after SingleCare's and Cost Plus Drugs' original plain-fetch paths were both replaced by Selenium — kept validated "in case a plain-fetch path is reintroduced later," which is exactly what happened for Cost Plus Drugs. SingleCare is still Selenium-only |
 | `SELENIUM_PAGE_LOAD_TIMEOUT` | `30` | Selenium page-load timeout |
 | `SELENIUM_WAIT_TIMEOUT` | `15` | Selenium explicit-wait timeout for locating elements |
 | `AMAZON_CHROME_PROFILE_DIR` | `.chrome-profile-amazon` | Where the persistent, logged-in Amazon Chrome profile is stored |
 | `ENABLED_SITES` | `goodrx,singlecare,amazon,costplusdrugs` | Default site list when `--sites` isn't passed |
-| `COSTPLUSDRUGS_LOOKUP_MODE` | `live` | `live` always scrapes the live site; `file` checks the static formulary spreadsheet first (see below) and only scrapes live if the drug is actually carried |
+| `COSTPLUSDRUGS_LOOKUP_MODE` | `live` | `live` always queries Cost Plus Drugs' public API; `file` checks the static formulary spreadsheet first (see below) and only queries the API if the drug is actually carried |
 | `COSTPLUSDRUGS_FORMULARY_PATH` | `TeamCubanCard_DownloadableMedicationList_08.06.2026.xlsx` | Path to the formulary spreadsheet; only read when `COSTPLUSDRUGS_LOOKUP_MODE=file` |
 | `GOODRX_INTERACTIVE_CAPTCHA` | `true` | When GoodRx shows a bot-check, opens a visible Chrome window and waits at the terminal for you to solve it (see below). Set `false` for unattended runs — GoodRx will just report the block as an error instead of prompting |
 | `SINGLECARE_INTERACTIVE_CAPTCHA` | `true` | Same idea, for SingleCare's DataDome challenge |
@@ -337,7 +404,7 @@ driver_utils.py            Shared undetected-chromedriver setup + SeleniumScrape
 utils.py                   Drug-name/slug normalization, price-from-text extraction
 goodrx_scraper.py          GoodRx — Selenium only, resolves the drug page via GoodRx's own search, prompts interactively to solve a CAPTCHA when challenged
 singlecare_scraper.py      SingleCare — Selenium only, resolves the drug page via SingleCare's own search, prompts interactively to solve a CAPTCHA when challenged
-costplusdrugs_scraper.py   Cost Plus Drugs — Selenium only, resolves the drug page via its own search then its on-page strength/quantity selectors (or static-formulary pre-check, see below)
+costplusdrugs_scraper.py   Cost Plus Drugs — calls their own public API directly (no browser at all; see below), or static-formulary pre-check first when COSTPLUSDRUGS_LOOKUP_MODE=file
 costplusdrugs_formulary.py Static Team Cuban Card formulary loader/matcher, used only in COSTPLUSDRUGS_LOOKUP_MODE=file
 amazon_scraper.py          Amazon Pharmacy — Selenium only, reuses a persistent logged-in profile
 requirements.txt           Python dependencies
@@ -349,26 +416,36 @@ TeamCubanCard_Downloadable...xlsx  Static Cost Plus Drugs formulary export (drug
 
 | Site | Approach |
 |---|---|
-| Cost Plus Drugs | Selenium only — drives the site's own search, then its on-page strength/quantity buttons (see [search, then strength/quantity selection](#cost-plus-drugs-search-then-strengthquantity-selection) below); its plain-fetch path is blocked outright now, same as SingleCare's |
+| Cost Plus Drugs | Direct HTTP calls to Cost Plus Drugs' own free public API — no browser at all (see [switched to their own public API](#cost-plus-drugs-switched-to-their-own-public-api) below) |
 | SingleCare | Selenium only — drives the site's own real search autocomplete to resolve the correct drug page (see [drug name → URL, via search](#singlecare-drug-name--url-via-search) below), then its dosage/quantity/ZIP controls; interactively prompts to solve a CAPTCHA when challenged (see below) |
 | GoodRx | Selenium only — plain fetches are blocked by bot detection; also drives the site's own search to resolve the drug page (see [drug name → URL, via search](#goodrx-drug-name--url-via-search) below); interactively prompts to solve a CAPTCHA when challenged (see below) |
 | Amazon Pharmacy | Selenium only, reusing the persistent logged-in Chrome profile from `--setup-amazon` — pricing isn't visible without an account. A plain `amazon.com` product search, not a dedicated pharmacy endpoint (see below) |
 
-Every site above is Selenium-only now, not just GoodRx/Amazon: Cost Plus
-Drugs and SingleCare originally had a plain-fetch fast path (their pricing
-was confirmed publicly readable during planning research, no login or
-JS needed), but both sites have since added bot protection (Cloudflare
-Bot Management and DataDome respectively) that blocks a plain `requests`
-fetch outright — confirmed live, every path on either site, including
+GoodRx, SingleCare, and Amazon Pharmacy remain Selenium-only: none of the
+three has a self-serve API for a personal project (see [switched to
+their own public API](#cost-plus-drugs-switched-to-their-own-public-api)
+for what was actually checked), so their pricing has no path but the
+rendered page. Cost Plus Drugs and SingleCare both originally had a
+plain-fetch fast path for that page (their pricing was confirmed
+publicly readable during planning research, no login or JS needed), but
+both sites added bot protection (Cloudflare Bot Management and DataDome
+respectively) that blocks a plain `requests` fetch of the *rendered
+page* outright — confirmed live, every path on either site, including
 each one's own homepage, now returns the same block regardless of what
-it's asked for. Selenium runs through `undetected-chromedriver`
-everywhere, not plain Selenium: without the stealth layer, a stock
-Selenium session gets blocked just as easily as a plain fetch. Confirmed
-live: even with `navigator.webdriver` spoofed and the obvious
-automation-controlled Chrome flags stripped, Cost Plus Drugs' Cloudflare
-still blocked a plain Selenium session's price-data API call — only
-`undetected-chromedriver`'s deeper patching (of the `chromedriver` binary
-itself) got through.
+it's asked for. This is unrelated to Cost Plus Drugs' now-in-use public
+API, a separate, deliberately-open endpoint with no bot protection on
+it at all — the blocked plain-fetch path refers to their normal
+consumer-facing website, back when this project still scraped it, and
+still describes SingleCare's site today. Selenium runs through
+`undetected-chromedriver` everywhere it's still used, not plain
+Selenium: without the stealth layer, a stock Selenium session gets
+blocked just as easily as a plain fetch. Confirmed live at the time:
+even with `navigator.webdriver` spoofed and the obvious automation-
+controlled Chrome flags stripped, Cost Plus Drugs' Cloudflare still
+blocked a plain Selenium session's request to *its own internal,
+undocumented* frontend price-data endpoint (not the public API used
+today) — only `undetected-chromedriver`'s deeper patching (of the
+`chromedriver` binary itself) got through.
 
 None of this is guaranteed to keep working — these are live anti-bot systems
 that can (and did, mid-development) change their detection posture at any
@@ -1860,7 +1937,283 @@ only one challenge is ever pending at a time regardless of which
 modal can get away with tracking a single shared pending-message/event
 pair instead of something keyed per-challenge.
 
-### Cost Plus Drugs: search, then strength/quantity selection
+### Cost Plus Drugs: switched to their own public API
+
+`costplusdrugs_scraper.py` no longer drives a browser at all. Researched
+directly (all four sources, in parallel) when asked to replace scraping
+with real API calls wherever possible:
+
+| Site | Public API? | Why it could/couldn't switch |
+|---|---|---|
+| **Cost Plus Drugs** | Yes — free, no signup, no key | Documented at [github.com/CostPlusDrugs/apidocs](https://github.com/CostPlusDrugs/apidocs) / [costplusdrugs.github.io/apidocs](https://costplusdrugs.github.io/apidocs/); verified live before switching (see below) |
+| GoodRx | Real API exists (`/v2/price/compare`, `/v2/coupon`) | Gated behind a "API Partnership Program" application — GoodRx review, likely a sales call, a distributorship agreement; reported terms require consumer-facing product integration and GoodRx's prior written consent for non-commercial use. No self-serve key. Still scraped (see below) |
+| SingleCare | Real API exists (RxSense Consumer API) | Docs and portal are login-gated; access is provisioned by an RxSense account manager, no public signup or pricing. Still scraped (see below) |
+| Amazon Pharmacy | None | Prescription drugs/Amazon Pharmacy items are explicitly listed as **excluded** from Amazon's own Product Advertising/Creators API policy. The only Pharmacy API integration that exists is a closed enterprise partnership (payers, manufacturers, digital-health platforms), no individual-developer path. Still scraped (see below) |
+
+So Cost Plus Drugs is the only one of the four where this was actually
+possible — the sections below through "Cost Plus Drugs: stable-price
+extraction" describe the **retired Selenium-based implementation**,
+kept for historical record; none of the selectors/buttons/functions
+they describe (`resolve_and_select()`, `STRENGTH_BUTTON_PREFIX`,
+`_wait_for_stable_price()`, etc.) exist in the current
+`costplusdrugs_scraper.py` any more.
+
+**The new implementation**, verified live against the real endpoint:
+a plain `GET` to `https://us-central1-costplusdrugs-publicapi.cloudfunctions.net/main`
+with `medication_name=<drug>` returns every NDC/strength/form Cost Plus
+Drugs carries for that name; `formulation`/`dosage` are matched against
+the response's `form`/`strength` fields with the same `token_matches()`
+used everywhere else in this project (hard-excluding on a mismatch and
+listing what's actually available, same as every other site's
+identity/dosage/formulation filters — showing the wrong strength is
+worse than showing nothing). A second request,
+`ndc=<matched NDC>&quantity_units=<N>`, returns `requested_quote` — an
+exact price for that exact pack size, not a rescaled estimate. Confirmed
+live: `ndc` for lisinopril 20mg with `quantity_units=30` returned
+`"$5.55"` — the *exact* dollar figure the old Selenium scraper's own
+confirmed-live comment recorded reading directly off the real page's "A
+30 count supply of 20mg Lisinopril will cost: ... $5.55" sentence, and
+the API accepts arbitrary quantities (`quantity_units=45` returned a
+real `"$5.83"`, not just the page's own preset 30/60/90 buttons) — a
+genuine capability improvement over clicking through fixed on-page
+buttons.
+
+Two honest caveats built into every result rather than glossed over:
+- **No `--quantity` given** → defaults to a fixed, clearly-labeled `30`
+  (`"30 count (assumed default quantity, not requested)"`), since the
+  API has no "what's this drug's own default pack size" field the way
+  the old scraper could read straight off the page's own sentence (that
+  default varies by drug, confirmed live, not always 30) — rather than
+  silently presenting an assumption as if it were Cost Plus Drugs' own
+  stated default.
+- **Shipping is never included in `price`.** The old scraper folded in
+  a flat "Standard Shipping" fee it re-read live off the page every time
+  (confirmed $5.25 as of that version). This API doesn't expose that fee
+  at all, and hardcoding the old confirmed number here would silently go
+  stale the moment Cost Plus Drugs changes it — so instead, `price_label`
+  says outright that shipping is excluded and charged separately at
+  checkout, rather than quietly reproducing a number this version has no
+  way to keep in sync.
+
+`zip_code` remains accepted-but-unused in `get_prices()`'s signature,
+same as before this switch — for call-signature parity with the other
+three sites' `get_prices()`, not because Cost Plus Drugs' flat mail-order
+pricing varies by location.
+
+**Fuzzy matching: confirmed there is none.** Live-tested directly
+against the endpoint: `medication_name=atorvastatin` (exact, 4 results)
+vs. `atorvastati` (truncated by one char), `torvastatin` (missing first
+char), `vastatin` (substring), `atorvastanin` (transposed letters), and
+`atorvastatin ` (trailing space) — every one of those returned zero
+results. It is case-insensitive (`ATORVASTATIN` still matches) but
+otherwise a plain exact-string lookup key, not a search.
+
+That exactness interacts badly with `medication_name` vs. `brand_name`
+being two disjoint fields: `medication_name=Lipitor` returns nothing —
+Lipitor only exists under `brand_name=Lipitor` (4 results, same drug).
+`medication_name=atorvastatin` is the mirror case. Before this fix,
+`get_prices()` only ever queried `medication_name`, so a user typing a
+brand name got a false "no Cost Plus Drugs catalog entry" even though
+the drug is genuinely stocked. Fixed by retrying `brand_name` whenever
+the `medication_name` lookup comes back empty, before reporting a real
+miss — confirmed live: `get_prices("Lipitor", "tablet", "40mg")` now
+returns a real price (`$5.72`) via the `brand_name` fallback, and a
+genuinely nonexistent drug name still correctly reports not-found
+(mentioning both fields were checked).
+
+Also confirmed live while investigating this: `medication_name=Atorvastatin
+Calcium` (i.e. including the salt name) returns zero results — the
+catalog's `medication_name` field only stores the bare generic name
+(`"Atorvastatin"`). Catalog naming here is genuinely inconsistent:
+confirmed live that 252 of 872 unique `medication_name` values *do*
+include a salt word (e.g. `"Acebutolol HCl"`, `"Acamprosate Calcium"`),
+so neither "always strip the salt" nor "never strip it" is safe as a
+blanket rule.
+
+**Salt-name fuzzy matching, added as a third tier.** Confirmed live: calling
+the API with *no* filter params at all returns its entire catalog — 2,373
+rows / 872 unique `medication_name` values as of this check, ~1.2MB —
+rather than an error or nothing. `_get_full_catalog()` fetches that once
+and caches it for the process's life (it doesn't change minute-to-minute,
+and re-fetching 1.2MB per fallback lookup would be wasteful).
+`_salt_stripped_lookup()` normalizes away a curated list of pure
+salt/counterion words (calcium, sodium, HCl, sulfate, tartrate, etc.)
+from both the query and every catalog `medication_name`/`brand_name`,
+then matches on the normalized string.
+
+This is deliberately conservative, not open-ended fuzzy/typo matching,
+for two reasons confirmed live during this investigation:
+- **Release-timing words are never stripped.** `"Metoprolol Tartrate"`
+  (immediate-release) and `"Metoprolol Extended Release (ER)"` are real,
+  clinically different catalog entries — stripping "ER"/"XR"/"DR"/"SR"/"CR"
+  the same way salts are stripped would silently collapse them into one
+  lookup.
+- **Even pure-salt normalization isn't collision-free.** Stripping only
+  true salt words still collapses some genuinely distinct products onto
+  the same key — confirmed live: `"Diclofenac Potassium"` (immediate-
+  release) vs. `"Diclofenac Sodium"` (enteric-coated), and
+  `"Levalbuterol HCl"` vs. `"Levalbuterol Tartrate"`. Rather than guess
+  between them (repeating the exact class of mistake this project's
+  formulation/dosage hard-exclude filters exist to avoid — a wrong drug
+  is worse than no drug), `_salt_stripped_lookup()` only *auto-accepts*
+  a normalized match when it resolves to exactly one distinct catalog
+  name. When 2+ distinct names collapse to the same key, `get_prices()`
+  refuses to guess and reports the specific candidates instead
+  (`"'Diclofenac' matches more than one distinct catalog entry ...:
+  Diclofenac Potassium, Diclofenac Sodium"`), so the caller can retype
+  the exact one they meant.
+
+When a salt-normalized match *does* auto-resolve, the result is never
+silently substituted — `price_label` says so explicitly
+(`"interpreted 'Atorvastatin Calcium' as Cost Plus Drugs' catalog entry
+'Atorvastatin' (salt name normalized away); ..."`), confirmed live via
+`get_prices("Atorvastatin Calcium", "tablet", "40mg")` → `$5.72` with that
+caveat attached.
+
+Deliberately **not** added: true edit-distance/typo-tolerant fuzzy
+matching (e.g. `difflib`) beyond salt-stripping. Real drug names are
+often one or two characters apart from a *different* real drug — the
+same reasoning that kept `amazon_scraper.py`'s `_matches_drug_name()`
+exact rather than fuzzy earlier in this project's history. A stricter,
+lower-confidence typo-matching layer could still be added later if
+needed, but only ever as a set of surfaced suggestions to choose from,
+never as a silent auto-pick.
+
+**`url` points to the right drug, but always the wrong quantity when
+one was actually requested.** Reported: a 90-count request's `url`
+opened to a page showing 30-count pricing. Confirmed live in a real
+browser session (not just reading the API's own fields) why: Cost Plus
+Drugs' product page has **no URL that encodes a specific quantity at
+all**. Clicking its own "90 Count" button in the on-page "Price
+Calculator" correctly updates the displayed price — to `$7.17`, the
+exact same figure this project's own `quantity_units=90` API call
+returns — but the URL, query string, and hash all stay completely
+unchanged. So `url` here was never wrong, exactly — it's already the
+single most specific link Cost Plus Drugs' own site has for a given
+drug+strength+form — it just always lands on the site's own default
+view (confirmed live: always 30, matching `DEFAULT_QUANTITY_UNITS`
+above) regardless of what was actually requested/quoted. `get_prices()`
+now appends a caveat to `price_label` whenever the requested quantity
+isn't 30, so a caller isn't left assuming the linked page will already
+reflect the quote it just returned:
+`"...; note: the linked page defaults to showing 30-count pricing —
+there is no quantity-specific URL on Cost Plus Drugs' site, so you'll
+need to reselect '90 Count' there yourself..."` — confirmed live via
+`get_prices("Atorvastatin", "tablet", "40mg", quantity="90")`.
+
+### Cost Plus Drugs: shipping fee, kept as a small periodically-refreshed file
+
+Asked directly: does the API return the shipping fee? No — confirmed
+earlier, its `requested_quote` is drug-only, no shipping field anywhere
+in the response. The fee is disclosed on the real product page as its
+own line ("Standard Shipping *Additional cost at checkout $5.25"), but
+getting *that* live isn't as simple as a plain HTTP request: confirmed
+live that the page sits behind a genuine Cloudflare JS challenge — even
+a `curl` request with a realistic Chrome User-Agent and standard headers
+still gets an HTTP 403 "Just a moment..." interstitial. Reading this one
+number at all requires a real browser, same as the Selenium
+infrastructure this project moved Cost Plus Drugs' own price lookups
+*away* from — so rather than reintroduce that into every price lookup,
+it's kept narrowly scoped to just this fee and refreshed occasionally
+instead of live per-request.
+
+**`costplusdrugs_shipping.py`** (new module) has two halves:
+- `update_shipping_fee()` — drives a real Chrome session (reusing
+  `driver_utils`' existing undetected-chromedriver setup, the same one
+  GoodRx/SingleCare/Amazon still use) to load a live product page and
+  read the fee straight off it, then writes `{fee, checked_at,
+  checked_url}` to a small JSON file (`costplusdrugs_shipping.json` by
+  default — `COSTPLUSDRUGS_SHIPPING_PATH` to override). Confirmed live,
+  twice in this session: got past the Cloudflare challenge *headlessly*,
+  no interactive CAPTCHA-solve needed, same as this project's original
+  Selenium-based Cost Plus Drugs scraper's history — and both runs read
+  back exactly **$5.25**, matching every prior confirmed-live figure
+  this project has recorded for this fee.
+- `load_shipping_fee()` — the cheap, non-Selenium read
+  `costplusdrugs_scraper.py`'s `get_prices()` calls on every lookup. Just
+  a plain file read; never touches a browser. Returns `None` (never
+  raises) when the file doesn't exist yet or is unreadable/malformed.
+
+**Refreshing it — run manually, or point a cron/launchd job at it:**
+```bash
+python costplusdrugs_shipping.py                    # headless (default)
+python costplusdrugs_shipping.py --debug            # visible Chrome window
+python main.py --update-costplusdrugs-shipping      # same thing, via main.py
+```
+There's no built-in scheduler — this project doesn't run a background
+process. Cost Plus Drugs' shipping fee changes rarely (confirmed live:
+unchanged $5.25 across every check this project has ever made, across
+different drugs, quantities, and now two separate runs of this new
+updater), so checking every few months is almost certainly enough.
+
+**The cache's own age is what keeps this honest**, rather than trusting
+an old number forever: every `price_label` now states the concrete cached
+fee and how many days old that check is —
+`"...excludes Cost Plus Drugs' flat standard shipping fee ($5.25 as of
+last check, 0 days ago; not returned by this API), charged separately at
+checkout"` — confirmed live for a fresh cache. Confirmed live for a
+deliberately-aged one, too: once the cache passes
+`STALE_SHIPPING_FEE_DAYS` (180), the same caveat gets an explicit warning
+appended instead of silently presenting a possibly-outdated number as
+current: `"— ⚠ that check is over 180 days old, the fee may have changed
+since; run costplusdrugs_shipping.py to refresh it"`. When no cache file
+exists at all yet, the caveat falls back to the original wording plus a
+pointer to the updater, rather than erroring or silently omitting the
+caveat.
+
+`price` itself is deliberately left unchanged by any of this — it's
+still just the drug price, not `price + shipping` — same reasoning as
+every other "don't silently bake in a number this version can't verify
+live" caveat elsewhere in this file: an explicit, dated shipping figure
+in the label is safer than an undated one folded invisibly into the
+headline price.
+
+**`gui.py` now triggers a refresh on its own** when the cache is missing
+or stale, instead of requiring someone to remember to run
+`costplusdrugs_shipping.py` by hand. Refreshing means driving a real
+Chrome session, so this is deliberately fire-and-forget: `gui.py` never
+blocks a price lookup on it — a request whose cache just went stale
+still gets an answer immediately (with whatever caveat the current cache
+state produces), while a background thread updates the file for the
+*next* lookup.
+
+Triggered from three places: at server startup (if `costplusdrugs` is
+enabled at all), and from both `/api/search` and `/api/v1/prices`
+whenever `costplusdrugs` is among the requested sites — so a long-running
+server stays current even without a restart. Two separate guards keep
+this from misbehaving:
+- `_shipping_refresh_lock` dedupes concurrent triggers — two requests
+  noticing a stale cache at the same moment don't launch two Chrome
+  sessions.
+- A one-hour cooldown (`SHIPPING_REFRESH_RETRY_SECONDS`), independent of
+  whether the last attempt succeeded — without it, a host with no
+  Chrome/display at all (e.g. a from-scratch deployment before Chrome is
+  installed) would retry, and fail, on *every single request*.
+
+The background refresh still goes through `_run_lock` — the same
+process-wide lock that already serializes every Selenium-touching
+operation in this file — so it queues behind (rather than races) a
+concurrent GoodRx/SingleCare/Amazon search or Amazon-setup, exactly like
+every other Selenium use here.
+
+Confirmed live, end-to-end: forced the cache to look 200+ days stale,
+called the trigger directly — it correctly detected staleness, launched
+exactly one background Chrome session (a concurrent second call was
+deduped, not queued as a duplicate), got past Cloudflare headlessly, and
+wrote back a fresh `$5.25` with an updated timestamp. Confirmed
+separately that a fresh cache is a true no-op (no thread spawned at
+all), and that hitting the real `/api/v1/prices?drug=lisinopril&dosage=
+20mg&sites=costplusdrugs` route through Flask's own test client reflects
+the newly-refreshed fee in that same request's `price_label`.
+
+A failed refresh (no Chrome installed, network error, page structure
+changed) is only logged server-side, never surfaced as an error to
+whatever price lookup happened to trigger it — `costplusdrugs_scraper.py`
+'s own price_label caveat already covers "no fee cached yet" or "cache is
+stale" gracefully on its own, so a failed background refresh just means
+that caveat keeps showing until a later attempt succeeds.
+
+### Cost Plus Drugs: search, then strength/quantity selection *(retired — historical)*
 
 Previously built directly from drug name + dosage + form
 (`costplusdrugs_slug()`: `{name}-{strength}-{form}`) — no failure was
@@ -2121,7 +2474,7 @@ helper](#clicking-through-overlays-a-shared-helper). Both re-verified
 live end-to-end after the refactor: same `$10.80`/`$12.42` results as
 before, unchanged.
 
-### Cost Plus Drugs: stable-price extraction
+### Cost Plus Drugs: stable-price extraction *(retired — historical)*
 
 Cost Plus Drugs' medication page is client-rendered (Next.js) with no
 data-testid/class hook on the price itself — just plain Tailwind utility
@@ -2148,10 +2501,13 @@ issues, both confirmed live in `costplusdrugs_scraper.py`:
 
 Cost Plus Drugs publishes a downloadable "Team Cuban Card" medication list —
 an .xlsx of every drug/strength/form it carries. **It has no pricing at
-all**, so it can never replace the live scrape above; what it's good for is
-a near-instant pre-check that skips the live site entirely for drugs that
-aren't carried in the first place, rather than spending several seconds on
-a live lookup just to get a "not found" back.
+all**, so it can never replace the live API call above; what it's good for
+is a near-instant pre-check that skips the live call entirely for drugs
+that aren't carried in the first place. This was originally a meaningful
+performance win (skipping a many-second Selenium page load); now that the
+live lookup is a cheap JSON request, it's more "confirm it's on our own
+formulary list" than a real speed optimization, but nothing about the
+switch to the API changed this feature, so it's unchanged here.
 
 With `COSTPLUSDRUGS_LOOKUP_MODE=file`:
 1. `costplusdrugs_formulary.py` loads the spreadsheet (`COSTPLUSDRUGS_FORMULARY_PATH`)
@@ -2160,26 +2516,117 @@ With `COSTPLUSDRUGS_LOOKUP_MODE=file`:
    strength via whitespace/case-insensitive comparison, form via prefix —
    e.g. `tablet` matches the file's `Tablet Delayed Release`).
 2. **Not listed** → returns immediately with "not carried by Cost Plus
-   Drugs", no network/browser activity at all.
-3. **Listed** → falls through to the exact same live scrape described
+   Drugs", no network activity at all.
+3. **Listed** → falls through to the exact same live API call described
    above, since the spreadsheet can't tell you the price — only that it's
-   worth asking the live site.
+   worth asking.
 
 The default (`COSTPLUSDRUGS_LOOKUP_MODE=live`) skips this file check
-entirely and always scrapes live, matching the original behavior. The
+entirely and always queries the API, matching the original behavior. The
 spreadsheet is dated (`Team Cuban Card` "Last Updated" note inside the file
 itself) — Cost Plus Drugs' actual catalog can drift from it over time, so
 treat a "not carried" result from file mode as best-effort too, same as
 everything else in this project.
 
+## Deploying to Render.com (Cost Plus Drugs only)
+
+Asked directly whether/how to deploy this on Render — the honest answer
+depends entirely on which sites are in play. GoodRx, SingleCare, and
+Amazon Pharmacy are Selenium-based and their bot-checks sometimes need
+an actual human to solve a CAPTCHA in a real, visible Chrome window on
+the same machine (see [GUI](#gui) above) — confirmed directly:
+`gui.py`'s "Done" button just tells the scraper a human solved it
+somewhere; it never streams or shows the browser itself. On a headless
+Render instance there's no display for that window to render on and no
+way for you to see it through the page, so those three genuinely can't
+work unattended on a host like this without a real rework (streaming
+the browser to the page, e.g. embedding noVNC — not attempted here).
+
+**Cost Plus Drugs has none of that problem** — it's a plain, free,
+public HTTP API call (see [switched to their own public
+API](#cost-plus-drugs-switched-to-their-own-public-api) above), so a
+Cost-Plus-Drugs-only deployment is genuinely straightforward. Two things
+had to change in `gui.py` to make restricting it to just that site
+actually safe, not just cosmetic:
+
+- The site checkboxes used to always render and accept all four sites
+  (`Config.ALL_SITES`) regardless of `ENABLED_SITES` — a client could
+  still `POST /api/search` for `goodrx` even if the page only showed
+  `ENABLED_SITES=costplusdrugs`'s checkbox. Both the rendered checkboxes
+  and the server-side site filter now use `Config.ENABLED_SITES`
+  instead, so a disabled site is rejected server-side, not just hidden
+  from the UI.
+- `/api/setup-amazon` always ran Amazon's interactive Selenium login
+  flow regardless of `ENABLED_SITES` — now returns a plain 403 unless
+  `amazon` is actually enabled, and the "Set up Amazon login…" button is
+  omitted from the page entirely in that case.
+- `gui.py` used to hard-code `host="127.0.0.1"` and `port=5057`, and
+  always tried to auto-open a local browser tab — none of which works
+  on a cloud host. It now binds `0.0.0.0` to Render's own `$PORT` (env
+  var Render sets automatically) and skips the local-only browser-open,
+  both keyed off whether `$PORT` is present at all — a plain local
+  `python gui.py` is completely unaffected, since that env var is never
+  set locally.
+
+### Steps
+
+1. Push this repo to GitHub (or GitLab) — Render deploys from a
+   connected repo, not a local directory.
+2. In Render: **New → Blueprint**, point it at the repo — it picks up
+   [`render.yaml`](render.yaml) automatically (Python runtime, build
+   command `pip install -r requirements.txt`, start command
+   `python gui.py`, `ENABLED_SITES=costplusdrugs` already set). Or set
+   the same thing up by hand with **New → Web Service** if you'd rather
+   not use a Blueprint — same three settings, plus that one env var.
+3. Deploy. Render assigns a public URL; open it and you should see the
+   GUI with only a "costplusdrugs" checkbox and no Amazon-setup button.
+   The [documented JSON API](#api) works the same way once deployed —
+   `curl "https://your-app.onrender.com/api/v1/prices?drug=lisinopril&dosage=20mg&sites=costplusdrugs"` —
+   and rejects any other site the same way the GUI's checkboxes do,
+   since both enforce `ENABLED_SITES` server-side.
+
+### Worth knowing before you do
+
+- **This makes the tool a public web page with no login in front of
+  it.** Render's free/starter tier gives anyone with the URL access to
+  run lookups (which just relay to Cost Plus Drugs' own free API — no
+  API key or credentials of yours are exposed by this). Fine for a
+  personal tool nobody else knows the URL to; add real auth in front of
+  it (Render supports basic auth / access control on paid plans, or put
+  your own check in `gui.py`) if that's not an acceptable risk for you.
+- **The other three sites' packages still get installed** even though
+  they're never used — `main.py`'s `_load_scrapers()` imports all four
+  scraper modules unconditionally regardless of `ENABLED_SITES`, so
+  `selenium`/`undetected-chromedriver`/`webdriver-manager`/`beautifulsoup4`/
+  `lxml` are still in `requirements.txt` and still get built. This is
+  harmless — none of them touch an actual Chrome binary at import time,
+  only when a scraper is actually invoked (confirmed: `driver_utils.py`'s
+  Chrome-resolving code lives entirely inside functions, never at module
+  level) — just a bigger, slower build than a Cost-Plus-only app
+  strictly needs. Making `_load_scrapers()` import only the sites in
+  `ENABLED_SITES` would trim this, but wasn't done here since it wasn't
+  asked for and wasn't needed to make the deployment work.
+- **Flask's built-in dev server** (what `python gui.py` runs) logs its
+  own warning about not being meant for production. For a personal,
+  low-traffic lookup tool this is fine as-is — `gui.py` already runs it
+  `threaded=True` for the challenge-modal polling GoodRx/SingleCare/
+  Amazon need, which happens to also just work as ordinary concurrent
+  request handling here. Swap in `gunicorn` (`pip install gunicorn`,
+  start command `gunicorn -w 1 --threads 4 -b 0.0.0.0:$PORT gui:app`) if
+  you want something more production-grade later; not necessary to get
+  this running.
+
 ## Disclaimer
 
-This tool scrapes third-party pharmacy pricing websites for personal,
-non-commercial use. It is not affiliated with GoodRx, SingleCare, Amazon,
-or Cost Plus Drugs. Automated scraping — including the automated-browser
-detection countermeasures this tool now uses to get past some sites' bot
-protection — may violate these sites' Terms of Service, and either their
-page structure or their bot-detection posture may change and break this
-tool at any time without warning. Treat all output as best-effort, not
-authoritative pricing — always confirm the actual price at checkout/pickup
-before relying on it.
+This tool queries GoodRx, SingleCare, and Amazon by scraping their
+pharmacy pricing websites, and queries Cost Plus Drugs through their own
+free public API (see [switched to their own public
+API](#cost-plus-drugs-switched-to-their-own-public-api)) — all for
+personal, non-commercial use. It is not affiliated with GoodRx,
+SingleCare, Amazon, or Cost Plus Drugs. Automated scraping — including
+the automated-browser detection countermeasures this tool uses to get
+past some sites' bot protection — may violate those three sites' Terms
+of Service, and either their page structure or their bot-detection
+posture may change and break this tool at any time without warning.
+Treat all output as best-effort, not authoritative pricing — always
+confirm the actual price at checkout/pickup before relying on it.
